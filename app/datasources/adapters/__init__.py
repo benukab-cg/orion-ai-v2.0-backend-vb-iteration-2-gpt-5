@@ -80,4 +80,12 @@ except Exception:
     # Postgres is optional; if import fails, skip built-in registration
     pass
 
+try:
+    from app.datasources.adapters.pinecone import PineconeConnector
+
+    registry.register(PineconeConnector())
+except Exception:
+    # Pinecone is optional; if import fails, skip built-in registration
+    pass
+
 
