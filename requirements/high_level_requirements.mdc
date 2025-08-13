@@ -1,0 +1,188 @@
+---
+description: This rule defined the high level project requirements. 
+globs: 
+alwaysApply: false
+---
+# Orion AI Platform Backend
+
+This project aims to develop a multi agent system where multiple agents with several capabilities work in collaboration to perform various tasks. These agents have access to several tools and knowledge bases to perform activities. Data Sources can be Vector Databases, SQL Databases, BLOB storages and many more. Ingestion pipelines are defined to ingest data from various input sources to these datasources. Agents can be standalone or in a network. Each one of these agent networks can be connected to a chatbot or a trigger that activates the agent on environmental conditions. Agents triggered from environmental conditions are considered as ambient agents and other which are activated via a chatbot are considered as conversational agents. Each agent has a connection a an LLM (Large Language Model). The developed platfrom exposes APIs in accordance with Open API 3.
+
+## 1. Requirements
+ 
+ - Datasources: Datasources are connections to the databases. These data sources can be different such as PostgreSQL, Pinecone Vector Store, MySQL, AWS S3. This datasource concept should support the ability to manage these different datasources. 
+ - Ingestion Pipelines: Ingestion Pipelines are responsible are ETL pipelines which supports transforming unstructured, semi structured or structured data in above mentioned datasources.
+ - AI Models: The purpose of this module is to manage AI models. These are basically connections to the AI Models. AI models can be of different types. For an example they could be LLMs, Embeding Models, or any conventional classification model.
+ - Agents - The purpose of agents is to perform specific activities. In this system agents can be standalone, in a network. These agent networs can be connected a chatbot or be triggered on environmental factors or both. Langgraph is used to create these agent networks. 
+ - Chatbots - Above agent networks are connected to chatbots and users can perform conversations with them. Users can create chat threads in the chatbot and interact with the chatbot.
+ - Security - The system should support creating user roles and for each user roles permission should be able to be defined. Furthermore for datasets, row level security should be implemented controlling which data in a specific dataset could be accessed by which user. Access controlling should be done with permissions instead of user roles. User roles are created by assigning permissions to it. 
+
+## 2. Tech Stack
+|Usecase|Library/Framework|
+|--|--|
+|Programming Language|Python|
+|Dependancy Management|Poetry|
+|Backend Development|FastAPI|
+|Database|SQL|
+|ORM|SQLAlchemy|
+|Agents & Agent Networks|LangGraph|
+
+## 3. Milestones
+
+###  1. Data Sources & Datasets
+
+Datasources are connections to the datasources. Datasources can come in several varieties and flavors. SQL, Vector Store, BLOB Storage. Then these sub varities can have different flavors PostgreSQL, MySQL, PineCone Vectorstore, AWS S3, Firebase Storage. From these datasources can be created. For an SQL database, datasets are tables. For a Pinecone vector store, datasets are it's vector indexes.
+Functionality should be there for each dataset for data manipulation and accessing.
+
+1. SQL Databases
+	- Execute custom read queries
+2. Vector Store Databases
+	- Get Similar Vectors with Cosine Similarity
+
+There should be the functionality to perform CRUD operations on the data sources and datasets.
+
+###  2. AI Models
+
+These are connections to the AI Models such as LLMs and Embedding Models for accessing them to function agents. There should be proper functionality to manage connection information here. These AI model connections could be OpenAI, Gemini, Open AI Embeddings.
+
+###  2. Agents
+
+#### 2.1 Agents & Tools
+
+Agents are resonsible for performing specific activities with or without the help of tools. Tools can be of many types. SQL tools can connect to SQL Datasets to read data from the SQL datasets (tables) mentioned above. Vector tools can connect to Vector Datasets (Indexes) to find most relavant data with similarity matching mechanisms such as Cosine similarity in RAG usecases.  
+Agents and tools should be able to be configured with templates instructions. The system should support functionality to define these agents from predefined templates. Once defined these agent definitions should be stored in the database for respawning on server start. LangGraph agents are utilized here.
+
+#### 2.2 Agent Networks
+
+Agents can be of following types.
+
+ - Standalone Agents: Agents which works alone for achieving it's tasks.
+ - Agent Swarm: Few agents are connected with each other following LangGraph Agent Swarm architecture for acheiving it's tasks.
+ - Supervised Agent Network: Few agents are connected to a supervisor agent for acheivng it's tasks. 
+
+These LangGraph agent networks should be able to be defined in a defintion language and should be able to be stored in the database. 
+Each agent network should have a communication interface such that other agent networks can use the agent network as a agent. For example, Finance Agent Swarm has an Agent called Customer Agent which is Customer Agent Swarm.
+
+#### 2.3 Agent Network Utlization
+
+Agents Networks can be connected to a chat bot for providing answers for user queries. Later these agent should have triggers such that they can act on environmental changes for example an agent triggering on a specific email. 
+
+###  3. Chat Bot
+
+ChatBot should answer customer queries calling the agent networks. When the agent answers customer queries from the knowledge bases such as Pinecone vector store, agent should return set of knowledge chunks use for answering to the chat bot. Chatbot can have chat threads specific to each user and each chat thread can have user messages and AI messages. 
+
+## Data Model
+This data model represents initial design but should be enhanced to better match the requirement instead of adhering fully to this. 
+```mermaid
+erDiagram
+    DEPARTMENTS {
+        string Name
+    }
+    
+    USER {
+        string Name
+    }
+    
+    USER_ROLE {
+        string Name
+    }
+    
+    PERMISSIONS {
+        string Name
+    }
+    
+    TRIGGER {
+        string Name
+    }
+    
+    AGENT_NETWORK {
+        string Name
+        string Type
+    }
+    
+    AGENT {
+        string Name
+    }
+    
+    AGENT_RELATIONSHIPS {
+        string ParentAgent
+        string ChildAgent
+        string Relationship
+    }
+    
+    CHAT_BOT {
+        string Name
+    }
+    
+    CHAT_THREAD {
+        string Name
+    }
+    
+    MESSAGE {
+        string Name
+    }
+    
+    USER_MESSAGE {
+    }
+    
+    AI_MESSAGE {
+    }
+    
+    AI_MODEL {
+        string Name
+    }
+    
+    OPENAI {
+    }
+    
+    GEMINI {
+    }
+    
+    DATA_PIPELINE {
+        string Name
+    }
+    
+    DATASET {
+        string Name
+    }
+    
+    DATA_SOURCE {
+        string Name
+    }
+    
+    PINECONE {
+    }
+    
+    POSTGRESQL {
+    }
+
+    %% Relationships
+    USER ||--o{ USER_ROLE : has
+    USER_ROLE ||--|| PERMISSIONS : has
+    
+    TRIGGER ||--o| AGENT_NETWORK : triggers
+    AGENT_NETWORK ||--|| CHAT_BOT : has
+    AGENT_NETWORK ||--o{ AGENT : contains
+    
+    AGENT ||--|| AGENT_RELATIONSHIPS : "parent in"
+    AGENT ||--|| AGENT_RELATIONSHIPS : "child in"
+    AGENT_NETWORK ||--o{ AGENT_RELATIONSHIPS : contains
+    
+    AI_MODEL ||--|| AGENT : powers
+    OPENAI ||--|| AI_MODEL : "is type of"
+    GEMINI ||--|| AI_MODEL : "is type of"
+    
+    CHAT_BOT ||--o{ CHAT_THREAD : has
+    CHAT_THREAD ||--o{ MESSAGE : contains
+    
+    MESSAGE ||--|| USER_MESSAGE : "is type of"
+    MESSAGE ||--|| AI_MESSAGE : "is type of"
+    
+    DATA_PIPELINE ||--o{ DATASET : produces
+    DATASET ||--o{ AGENT : "trains/used by"
+    DATA_SOURCE ||--o{ DATASET : feeds
+    
+    DATA_SOURCE ||--|| PINECONE : "is type of"
+    DATA_SOURCE ||--|| POSTGRESQL : "is type of"
+
+
+```

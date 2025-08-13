@@ -1,0 +1,252 @@
+---
+description: Detailed requirements for the Datasources module (connections only)
+globs:
+  alwaysApply: false
+---
+
+# Datasources Module Requirements
+
+This document specifies requirements for the Datasources module. Datasources are secure, managed connections to external data storages. They do not perform any data read/write or manipulation; all data operations are handled by Datasets. For vector datasources, Datasets represent vector indexes. For SQL datasources, Datasets represent tables. For blob storages, Datasets represent buckets/containers and optionally prefixes.
+
+## 1. Scope and Non‑Goals
+
+- In scope
+  - Define, store, validate, secure, and test connections to supported datasource types
+  - Provide CRUD APIs and service layer for managing datasource definitions
+  - Expose type metadata and configuration schemas for client UIs
+  - Enforce multi‑tenancy and permission controls over datasource definitions
+  - Redact and encrypt secrets at rest; never expose raw secrets over APIs or logs
+  - Support connection testing (reachability/auth validation) without performing data operations
+- Non‑goals
+  - No data manipulation, ingestion, indexing, querying, or listing of remote resources
+  - No dataset management (covered by the Datasets module)
+  - No long‑lived pools accessible to callers; any test connections must be short‑lived
+
+## 2. Supported Datasource Types (MVP)
+
+- Vector Databases
+  - Pinecone
+- SQL Databases
+  - PostgreSQL
+  - MySQL
+  - SQL Server
+- Blob/Object Storages
+  - AWS S3
+  - Firebase Storage
+
+Notes
+  - The above are baseline examples for the MVP and are non‑exhaustive.
+  - The system must support additional providers without code changes to the core module by installing connectors.
+
+Examples of additional providers (non‑exhaustive)
+  - Vector: Milvus, Qdrant, Weaviate, Chroma, Elasticsearch kNN, Azure AI Search
+  - SQL/Relational/Warehouses: MariaDB, Amazon Aurora, Snowflake, BigQuery, Redshift, Azure SQL
+  - Blob/Object: Google Cloud Storage, Azure Blob Storage, MinIO, DigitalOcean Spaces, S3‑compatible stores
+
+Extensibility: The design must allow adding new types without changing core logic by registering new connectors that implement a common interface (see Section 6).
+
+## 3. Configuration Model
+
+- Common fields (all types)
+  - id: UUID (server‑generated)
+  - name: string (unique per tenant)
+  - type: string (registry‑validated type slug, e.g., "vector.pinecone", "sql.postgres", "blob.aws_s3")
+  - category: enum [vector, sql, blob, other]
+  - type_version: string (optional; semantic version of the connector/type)
+  - description: optional string
+  - tags: string[] (optional)
+  - tenant_id: UUID/string (organizational scope)
+  - owner_id: UUID/string (creator/owner)
+  - is_enabled: boolean (default true)
+  - created_at, updated_at: timestamps
+  - created_by, updated_by: user identifiers
+  - config: JSON (validated and redacted per type)
+
+- Secrets handling
+  - All secret values must be stored encrypted at rest using application‑level encryption (e.g., KMS/Keyring/Fernet) before persisting to the database.
+  - Secrets must be redacted in all API responses and logs. Provide stable placeholders to indicate presence of existing secrets (e.g., "__REDACTED__").
+  - Support credential rotation: allow updating one or more secret fields without exposing others.
+
+- Type‑specific config schemas (minimum fields)
+  - pinecone
+    - api_key: secret string
+    - environment or region: string
+    - project_name: optional string
+  - postgres
+    - host: string
+    - port: integer (default 5432)
+    - database: string
+    - username: string
+    - password: secret string
+    - ssl_mode: enum [disable, prefer, require, verify-ca, verify-full] (default require)
+  - mysql
+    - host: string
+    - port: integer (default 3306)
+    - database: string
+    - username: string
+    - password: secret string
+    - ssl_mode: enum [disable, preferred, required] (default required)
+  - sqlserver
+    - host: string
+    - port: integer (default 1433)
+    - database: string
+    - username: string
+    - password: secret string
+    - encrypt: boolean (default true)
+    - trust_server_certificate: boolean (default false)
+  - aws_s3
+    - access_key_id: secret string
+    - secret_access_key: secret string
+    - session_token: secret string (optional)
+    - region: string
+    - endpoint_url: string (optional, for S3‑compatible)
+    - default_bucket: string (optional; dataset may override)
+  - firebase_storage
+    - project_id: string
+    - service_account_json: secret JSON (string)
+    - bucket: string (optional; dataset may override)
+
+Validation: All schemas must be defined using strong types (e.g., Pydantic models) with per‑field validation and cross‑field constraints.
+
+## 4. Data Model (Persistence)
+
+- Tables (minimum)
+  - data_source
+    - id, name, type, description, tags (JSONB/array), tenant_id, owner_id,
+      is_enabled, created_at, updated_at, created_by, updated_by
+  - data_source_config
+    - data_source_id (FK), config_encrypted (bytes/blob), config_schema_version (string),
+      redaction_map (JSON), updated_at
+  - audit_log (shared)
+    - id, tenant_id, user_id, action, entity_type, entity_id, timestamp, metadata
+
+Constraints
+  - Unique (tenant_id, name)
+  - Foreign keys with cascade delete from data_source -> data_source_config
+  - Soft delete on data_source (deleted_at nullable) to preserve history; hard delete only via admin tooling
+
+## 5. APIs (HTTP, OpenAPI 3)
+
+- POST /datasources
+  - Create a datasource; validate schema; encrypt and store secrets; return created resource with redacted config
+- GET /datasources
+  - List datasources for current tenant; filter by type, enabled, tag; pagination and sorting
+- GET /datasources/{id}
+  - Fetch single datasource; redact secrets
+- PATCH /datasources/{id}
+  - Partial update; allow secret rotation by passing new values; unchanged secret fields remain intact
+- DELETE /datasources/{id}
+  - Soft delete; deny if referenced by active datasets unless forced with policy
+- POST /datasources/{id}/test-connection
+  - Perform short‑lived connectivity/auth check using current (or supplied override) config; do not read or mutate remote data
+- POST /datasources/{id}/enable
+- POST /datasources/{id}/disable
+- GET /datasources/types
+  - Return dynamically discovered supported types (built‑in and plugin) with versioned config JSON Schemas, UI hints (labels, placeholders, secret flags), category, type slug, and source (builtin|plugin)
+
+API Security & Behavior
+  - Enforce RBAC permissions: datasource:create, read, update, delete, test, enable, disable
+  - All responses must redact secret fields consistently
+  - Rate‑limit test‑connection to prevent abuse (per tenant and per datasource)
+  - Idempotency for POST /datasources via optional idempotency key header
+
+## 6. Service Layer and Connector Interface
+
+- Service responsibilities
+  - Validate requests against per‑type schemas
+  - Normalize configs (e.g., trim strings, default ports)
+  - Encrypt/decrypt secrets transparently for persistence
+  - Redact configs for outbound responses and logs
+  - Invoke connector.test_connection(config) when requested
+
+- Connector interface (per type)
+  - validate_config(config) -> None or error list
+  - redact_config(config) -> redacted_config
+  - test_connection(config, timeout_s=10) -> { status: "ok"|"failed", latency_ms, details }
+  - get_json_schema() -> JSON Schema draft for UI/validation
+
+- Implementation notes
+  - Use a registry to map type -> connector (supports runtime discovery)
+  - Discovery: load connectors via plugin entry points (e.g., Python entry_points group "orion.datasources") in addition to built‑ins
+  - Connector metadata: type_slug, display_name, category, version, capabilities (must exclude any data operations)
+  - Connectors must not perform any data listing or mutation; only minimal auth/handshake
+  - Timeouts are mandatory; default 10s, configurable per request
+
+## 7. Security, Privacy, and Compliance
+
+- Secrets
+  - Encrypt at rest using a tenant‑wide or app‑wide master key managed securely
+  - In transit: require TLS for all remote endpoints where applicable
+  - Do not log secrets; ensure structured logging redacts values
+- Access control
+  - Enforce tenant isolation on all operations
+  - Permissions as per RBAC; admins can manage across departments if policy allows
+- Auditing
+  - Log create/update/delete/enable/disable/test actions with actor, timestamp, and redacted metadata
+- Compliance
+  - Adhere to OWASP ASVS for secret management and sensitive data exposure
+
+## 8. Observability and Reliability
+
+- Metrics
+  - Counters: datasources_created, datasources_deleted, test_connection_success, test_connection_failure
+  - Histograms: test_connection_latency_ms by type
+- Health
+  - Background optional re‑validation job (configurable) for critical datasources; failures trigger alerts but do not auto‑disable unless configured
+- Error model
+  - Consistent error codes: DS_VALIDATION_ERROR, DS_SECRET_MISSING, DS_UNREACHABLE, DS_AUTH_FAILED, DS_RATE_LIMITED, DS_CONFLICT, DS_NOT_FOUND
+
+## 9. Performance and Limits
+
+- Test connection must complete within the configured timeout (default 10s, max 30s)
+- Pagination defaults: limit=20, max=100
+- Name length <= 128; description <= 1024; tag key/value <= 64
+
+## 10. Compatibility and Extensibility
+
+- Type slugs
+  - Format: "<category>.<provider>" (e.g., "vector.pinecone", "sql.postgres", "blob.aws_s3")
+  - Validated against the registry; unknown slugs are rejected
+- Adding a new datasource type requires:
+  - Implementing the connector interface (Section 6)
+  - Publishing a package that registers an entry point under the agreed group (e.g., "orion.datasources")
+  - Registering the type slug and JSON Schema via the entry point
+  - Adding minimal integration tests and contract tests for validation and redaction
+  - No changes to the core datasources service code
+
+## 11. Migrations and Versioning
+
+- Provide initial migrations to create tables and indexes listed in Section 4
+- Version config schemas with config_schema_version to support evolution
+- Backward‑compatible redaction handling for legacy stored configs
+
+## 12. Testing Requirements
+
+- Unit tests
+  - Schema validation per type (valid and invalid cases)
+  - Redaction behavior (API and logs)
+  - Secret rotation logic
+  - Test‑connection happy path and failure modes (auth failure, timeout, DNS error)
+- Integration tests
+  - CRUD lifecycle for each type without contacting real systems (use fakes/mocks)
+  - Optional smoke tests with live sandboxes gated behind env flags (never in CI by default)
+
+## 13. Acceptance Criteria (MVP)
+
+- Can create, read, update, soft‑delete, enable/disable datasources for all supported types
+- Secrets are encrypted at rest and redacted in all responses/logs
+- Test‑connection endpoint returns accurate status within timeout and never performs data operations
+- RBAC enforced for all endpoints; tenant isolation verified
+- JSON Schemas exposed for UI form generation per type
+- Observability present with basic metrics and audit logs
+ - Registry supports dynamic discovery of plugin connectors; GET /datasources/types lists both built‑in and plugin types
+ - 'type' field accepts any registry‑known slug and rejects unknown slugs; 'category' aligns with the registered connector
+
+## 14. Notes on Dataset Interaction
+
+- Datasets will reference datasources by id and define resource‑level details:
+  - Vector: index name(s)
+  - SQL: table/schema names
+  - Blob: bucket/container and optional prefix
+- The Datasources module must not assume or validate dataset‑specific resources beyond ensuring the connection is valid.
+
