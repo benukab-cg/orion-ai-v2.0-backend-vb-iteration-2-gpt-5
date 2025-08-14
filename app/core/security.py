@@ -24,6 +24,20 @@ def get_current_principal() -> Principal:  # Stub for now
         "datasource:test",
         "datasource:enable",
         "datasource:disable",
+        # Datasets CRUD
+        "dataset:create",
+        "dataset:read",
+        "dataset:update",
+        "dataset:delete",
+        "dataset:enable",
+        "dataset:disable",
+        # Dataset data-plane (read-only)
+        "dataset_data:select",
+        "dataset_data:schema",
+        "dataset_data:stats",
+        "dataset_data:query",
+        "dataset_data:get",
+        "dataset_data:presign_get",
     })
 
 

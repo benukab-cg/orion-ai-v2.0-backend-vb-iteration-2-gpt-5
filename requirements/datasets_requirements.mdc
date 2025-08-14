@@ -1,0 +1,257 @@
+---
+description: Detailed requirements for the Datasets module (data operations)
+globs:
+  alwaysApply: false
+---
+
+# Datasets Module Requirements
+
+Datasets are logical bindings to resource‑level entities within a Datasource and are the only module allowed to perform data operations. In this phase, all operations are explicitly read‑only. A Dataset references a single Datasource and describes how to locate and operate on a concrete resource inside it:
+- SQL: a table (optionally schema‑qualified)
+- Vector: an index (and optional namespace)
+- Blob/Object: a single file (object key) within a bucket/container
+
+The Datasources module owns secure connection management; Datasets own data‑plane operations and row‑level access enforcement.
+
+## 1. Scope and Non‑Goals
+
+- In scope
+  - CRUD for Dataset definitions (bind a resource to a Datasource)
+  - Typed configuration and validation per category/provider
+  - Read‑only data operations against the bound resource
+  - Lightweight schema/metadata discovery per dataset with persistence to database
+  - Row‑level security (RLS) enforcement per dataset and per user/role
+  - Pagination, sorting and filtering primitives; server‑side limits
+  - Observability (metrics, audit logs), consistent error model
+- Non‑goals
+  - Managing Datasource connections or secrets (owned by Datasources)
+  - Any create/update/delete or upsert data mutations
+  - Cross‑dataset joins/transactions and cross‑Datasource transactions
+  - Long‑running ingestion/indexing pipelines (owned by Pipelines)
+  - Embedding generation; vectors must be provided by callers/pipelines (MVP)
+
+## 2. Supported Categories and MVP Providers
+
+- Vector Databases
+  - Pinecone (MVP)
+- SQL Databases
+  - PostgreSQL (MVP)
+- Blob/Object Storages
+  - Read single file objects
+
+The design must be extensible to additional providers without changing core logic by registering new dataset connectors.
+
+## 3. Configuration Model
+
+- Common fields (all datasets)
+  - id: UUID (server‑generated)
+  - name: string (unique per tenant)
+  - description: optional string
+  - tags: string[] (optional)
+  - tenant_id: UUID/string
+  - owner_id: UUID/string
+  - category: enum [sql, vector, blob, other]
+  - data_source_id: UUID (FK → Datasources)
+  - is_enabled: boolean (default true)
+  - created_at, updated_at; created_by, updated_by
+  - config: JSON (validated per category/provider)
+
+- Category‑specific config (minimum)
+  - sql
+    - schema: string (optional; default provider default)
+    - table: string (required)
+    - query_timeout_s: integer (default 15, max 60)
+  - vector
+    - index: string (required)
+    - namespace: string (optional)
+    - dimension: integer (optional hint; validated at runtime if provided)
+    - distance: enum [cosine, dot, euclidean] (optional; provider default)
+    - allowed_metadata_fields: string[] (optional; restricts filterable keys; discovery is on-demand)
+  - blob
+    - object_key: string (required)
+    - bucket: string (optional override; Datasource default may apply)
+    - presign_ttl_s: integer (optional; default 300)
+
+Validation must be defined via strong types (e.g., Pydantic) with cross‑field checks. Datasource category and dataset category must be compatible.
+
+## 4. Data Model (Persistence)
+
+- Tables (minimum)
+  - dataset
+    - id, name, description, tags (JSONB/array), tenant_id, owner_id,
+      category, data_source_id (FK), is_enabled, created_at, updated_at,
+      created_by, updated_by, deleted_at (nullable for soft delete)
+  - dataset_config
+    - dataset_id (FK), config_json (JSONB), config_schema_version (string), updated_at
+  - dataset_cached_schema
+    - dataset_id (FK), category (enum), schema_json (JSONB), schema_version (string|null), updated_at
+  - dataset_metadata_profile
+    - dataset_id (FK), fields (JSONB), updated_at
+  - dataset_rls_policy
+    - id, dataset_id (FK), principal_type [user|role|tenant|public], principal_id (nullable for tenant/public),
+      actions (string[]), effect [allow|deny], condition (CEL/expr JSON; optional),
+      sql_filter (text; optional), vector_filter (JSON; optional), blob_key_constraint (string; optional; supports exact or glob),
+      priority (integer; lower wins), created_at
+  - audit_log (shared)
+
+Constraints
+- Unique (tenant_id, name)
+- FK dataset → datasource with on‑delete restrict (unless forced via policy)
+- Soft delete on dataset; preserve history in audit log
+
+## 5. Capabilities by Category (MVP)
+
+- SQL (PostgreSQL)
+  - Read: parameterized SELECT on the configured table only; supports projection, predicates, order_by, limit/offset
+  - Schema: persist and expose table schema (columns, types, nullability); maintain via periodic/on‑demand discovery
+  - Safety: server‑side timeouts; strictly parameterized; deny DDL/DCL, multi‑table queries, subqueries, unions, and any writes
+- Vector (Pinecone)
+  - Query only: top_k similarity by query vector, with optional metadata filter and namespace; results include stored metadata when provider returns it
+  - Metadata: persist and expose metadata profile/fields for filtering (discovered from stored items or provided by pipelines)
+  - Stats: dimension, total vectors, namespaces
+- Blob (Files)
+  - Get/download a single configured object by its key; optional byte‑range support; optional presigned GET URL
+
+## 6. APIs (HTTP, OpenAPI 3)
+
+- Dataset CRUD
+  - POST /datasets
+  - GET /datasets
+  - GET /datasets/{id}
+  - PATCH /datasets/{id}
+  - DELETE /datasets/{id}
+  - POST /datasets/{id}/enable
+  - POST /datasets/{id}/disable
+
+- SQL dataset operations
+  - POST /datasets/{id}/sql/select
+    - body: { columns?, where?, params?, order_by?, limit?, offset? }
+  - GET  /datasets/{id}/sql/schema
+  - GET  /datasets/{id}/sql/count
+
+- Vector dataset operations
+  - POST /datasets/{id}/vector/query
+    - body: { vector: float[], top_k: int, filter?: object, include_values?: boolean, include_metadata?: boolean, namespace?: string }
+  - GET  /datasets/{id}/vector/stats
+
+- Blob dataset operations
+  - GET  /datasets/{id}/blob/get
+    - query/body: { range?: { start?: int, end?: int } } (reads configured object_key)
+  - POST /datasets/{id}/blob/presign
+    - body: { op: "get", ttl_s?: int }
+
+API Security & Behavior
+- Enforce RBAC permissions: dataset:create, read, update, delete, enable, disable
+- Data‑plane permissions (read‑only): dataset_data:select, query, stats, schema, get, presign_get
+- Tenant isolation for all operations
+- Respect dataset.is_enabled and underlying datasource.is_enabled
+
+## 7. Service Layer and Connector Interface
+
+- Service responsibilities
+  - Validate dataset definitions against category schema and datasource compatibility
+  - Redact logs; never log data payloads unless explicitly whitelisted and safe
+  - Enforce RBAC and evaluate RLS before executing operations
+  - Normalize and bound operations (limits, timeouts, batch sizes)
+  - Translate abstract requests into provider calls via connectors
+
+- Connector registry
+  - Map (category, provider) → dataset connector
+  - Discovery via built‑ins and plugins (e.g., entry_points "orion.datasets")
+
+- Dataset connector interface (per category/provider)
+  - validate_dataset_config(config) -> None or error list
+  - describe_schema(ds, limit_fields?) -> { columns|dimension|stats }
+  - For SQL: select(ds, query_spec)
+  - For Vector: query(ds, vector, top_k, filter, opts), stats(ds)
+  - For Blob: get(ds, range?), presign_get(ds, ttl)
+  - apply_rls(context, operation, spec) -> spec' (category‑specific transformation)
+  - limits() -> capability/limit metadata (timeouts, result caps)
+
+## 8. Row‑Level Security (RLS)
+
+- Policy model
+  - Policies target a dataset and a set of actions; evaluated in priority order
+  - Attributes available: request.user.id, roles, tenant_id, dataset.id, request.params/metadata
+  - Effects: deny overrides allow; absent allow implies deny by default for data access
+  - Conditions expressed in a safe expression language (e.g., CEL); category‑specific filters supplied per policy as needed
+
+- Enforcement by category
+  - SQL: combine policy sql_filter with caller where via AND; inject as parameterized predicate; restrict columns to dataset table; deny multi‑table constructs
+  - Vector: merge policy vector_filter object with caller filter using AND semantics per provider
+  - Blob: evaluate blob_key_constraint against the configured object_key; deny if not matched
+
+- Auditing
+  - Log policy id, effect, operation, and high‑level outcome (no sensitive data)
+
+## 9. Security, Privacy, and Compliance
+
+- All data operations execute via the referenced Datasource with secrets handled only by the Datasource layer
+- Enforce TLS in transit; never log raw payloads with PII unless redacted
+- Rate‑limit data‑plane operations per tenant and per dataset
+- Validate and sanitize user inputs; SQL strictly parameterized; cap result sizes
+
+## 10. Observability and Reliability
+
+- Metrics
+  - Counters: dataset_ops_total by category, operation, provider, status
+  - Histograms: dataset_op_latency_ms by category/operation
+  - Gauges: dataset_enabled_total, vector_index_size (if available)
+- Health
+  - Optional background metadata refresh (schema/stats) with backoff
+- Error model (examples)
+  - DATASET_NOT_FOUND, DATASET_DISABLED, DATASET_ACCESS_DENIED, DATASET_RLS_DENIED
+  - SQL_QUERY_TIMEOUT, SQL_SYNTAX_ERROR_MASKED
+  - VECTOR_DIMENSION_MISMATCH, VECTOR_INDEX_NOT_FOUND
+  - BLOB_KEY_INVALID, BLOB_OBJECT_NOT_FOUND
+
+## 11. Performance and Limits (MVP defaults)
+
+- Pagination defaults: limit=20, max=100 (list/select); vector top_k default=10, max=1000
+- SQL query timeout: default 15s, max 60s; max row count per request = 5,000
+- Payload size caps: request body 5 MB (SQL/vector metadata); streaming required above
+
+## 12. Compatibility and Extensibility
+
+- Adding a new dataset provider requires implementing the connector interface and registering it in the dataset registry
+- Dataset type/category must be compatible with the Datasource provider
+- JSON Schemas for dataset config exposed for UI form generation
+
+## 13. Migrations and Versioning
+
+- Provide initial migrations for dataset, dataset_config, dataset_rls_policy
+- Version dataset config with config_schema_version to support evolution
+- Backward‑compatible policy evaluation for legacy policies
+
+## 14. Testing Requirements
+
+- Unit tests
+  - Config validation per category/provider
+  - RLS evaluation and category‑specific enforcement transformations
+  - Limits and normalization (pagination, batch, timeouts)
+- Integration tests
+  - CRUD lifecycle; enable/disable behavior
+  - SQL (PostgreSQL): SELECT on single table only; schema discovery; timeout handling; denial of disallowed constructs
+  - Vector (Pinecone): query/stats; metadata filter handling; dimension mismatch handling
+  - Blob (Files): GET and range requests for configured object_key only; presign GET
+  - RLS applied correctly across categories
+- Contract tests per connector (mock/fake provider clients; optional live smoke tests behind env flags)
+
+## 15. Acceptance Criteria (MVP)
+
+- Can create datasets bound to existing Pinecone and PostgreSQL datasources
+- Can perform:
+  - SQL: safe, parameterized SELECT only on the configured table
+  - Vector: query top_k with metadata filters on the configured index; results include metadata
+  - Blob: read a single configured file (object_key); optional range and presigned GET
+- Mutating operations (insert/update/delete/upsert/put) are not exposed
+- RLS policies restrict SQL rows and Vector results; Blob access limited to configured key and policy
+- RBAC enforced for dataset CRUD and data operations; tenant isolation verified
+- APIs return within configured limits/timeouts; observability metrics and audit logs present
+
+## 16. Notes on Interaction with Datasources and Pipelines
+
+- Datasets reference datasources by id; operations fail if the datasource is disabled or invalid
+- Dataset operations are read‑only; no table/index/file creation or mutation in this phase
+- Data population (e.g., vector upserts, file writes) occur via external systems or ingestion pipelines, not via Dataset APIs
+
