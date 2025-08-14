@@ -17,7 +17,8 @@ dependencies = [
     "cryptography (>=41,<44)",
     "psycopg[binary] (>=3.1,<4.0)",
     "alembic (>=1.16.4,<2.0.0)",
-    "httpx (>=0.27,<0.28)"
+    "httpx (>=0.27,<0.28)",
+    "pinecone (>=3.0.0,<6.0.0)"
 ]
 
 [tool.alembic]

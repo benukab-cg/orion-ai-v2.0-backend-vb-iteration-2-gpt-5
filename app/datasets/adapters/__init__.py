@@ -96,4 +96,12 @@ except Exception:
     # Optional; if import fails (missing driver), skip registration
     pass
 
+try:
+    from app.datasets.adapters.pinecone import PineconeDatasetConnector
+
+    registry.register(PineconeDatasetConnector())
+except Exception:
+    # Optional; if import fails (missing httpx or env), skip registration
+    pass
+
 
