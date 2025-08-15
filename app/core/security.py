@@ -24,6 +24,14 @@ def get_current_principal() -> Principal:  # Stub for now
         "datasource:test",
         "datasource:enable",
         "datasource:disable",
+        # AI Models full access (for development/testing)
+        "ai_model:create",
+        "ai_model:read",
+        "ai_model:update",
+        "ai_model:delete",
+        "ai_model:test",
+        "ai_model:enable",
+        "ai_model:disable",
         # Datasets CRUD
         "dataset:create",
         "dataset:read",

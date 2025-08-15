@@ -1,0 +1,250 @@
+---
+description: Detailed requirements for the AI Models module (connections to external LLMs and Embedding services only)
+globs:
+  alwaysApply: false
+---
+
+# AI Models Module Requirements
+
+This document specifies requirements for the AI Models module. AI Models are secure, managed connections to external inference services. The application does not host, store, fine‑tune, or manage any model weights. The module only manages connection definitions and metadata for consuming services (Agents, Chatbots, Pipelines) to invoke external providers.
+
+Categories supported:
+- LLMs (e.g., OpenAI GPT, Google Gemini, on‑prem Llama 3 via OpenAI‑compatible, vLLM, or Ollama gateways)
+- Embedding Models (e.g., OpenAI Embeddings; others via pluggable connectors)
+
+No inference logic, routing, or prompt orchestration lives in this module; it strictly manages connections and exposes discovery and validation capabilities.
+
+## 1. Scope and Non‑Goals
+
+- In scope
+  - Define, store, validate, secure, and test connections to LLM and Embedding providers
+  - Provide CRUD APIs and service layer for managing AI model connection definitions
+  - Expose type metadata and configuration schemas for client UIs
+  - Redact and encrypt secrets at rest; never expose raw secrets via APIs or logs
+  - Support short‑lived connectivity/auth checks without performing billable inference by default
+  - Surface static capability metadata where available (e.g., supported models list, max tokens, embedding dimensions) for consumer validation
+- Non‑goals
+  - No model hosting, training, fine‑tuning, or weight management
+  - No prompt templates, routing, moderation, or conversation orchestration (owned by Agents/Chatbots layer)
+  - No long‑lived clients/pools exposed to callers; any test connections must be short‑lived
+
+## 2. Supported Categories and MVP Providers
+
+- LLM Providers
+  - OpenAI GPT (e.g., gpt‑4o, gpt‑4.1, gpt‑3.5‑turbo)
+  - Google Gemini (e.g., gemini‑1.5‑pro, gemini‑1.5‑flash)
+  - On‑prem Llama 3 via gateways
+    - OpenAI‑compatible (e.g., vLLM, TGI, LM Studio, Text Generation WebUI)
+    - Ollama (local runtime)
+- Embedding Providers
+  - OpenAI Embeddings (e.g., text‑embedding‑3‑small/large)
+  - Generic/OpenAI‑compatible embeddings via on‑prem gateways
+
+Notes
+- The above are baseline examples for the MVP and are non‑exhaustive.
+- The system must support additional providers without core changes via a connector registry.
+
+## 3. Configuration Model
+
+- Common fields (all types)
+  - id: UUID (server‑generated)
+  - name: string (unique per tenant)
+  - type: string (registry‑validated type slug, e.g., "llm.openai", "llm.gemini", "llm.llama3_onprem", "embedding.openai")
+  - category: enum [llm, embedding]
+  - type_version: string (optional; semantic connector version)
+  - description: optional string
+  - tags: string[] (optional)
+  - tenant_id: UUID/string (organizational scope)
+  - owner_id: UUID/string (creator/owner)
+  - is_enabled: boolean (default true)
+  - created_at, updated_at: timestamps
+  - created_by, updated_by: user identifiers
+  - config: JSON (validated and redacted per type)
+
+- Secrets handling
+  - All secrets must be encrypted at rest (e.g., KMS/Keyring/Fernet) prior to persistence
+  - Secrets are redacted in all API responses/logs with stable placeholders (e.g., "__REDACTED__")
+  - Support credential rotation; allow updating specific secrets without revealing others
+
+- HTTP/runtime settings (optional, defaulted)
+  - request_timeout_s: integer (default 30, max 120)
+  - connect_timeout_s: integer (default 10, max 30)
+  - max_retries: integer (default 2)
+  - extra_headers: object (optional non‑secret headers)
+
+- Type‑specific config schemas (minimum fields)
+  - llm.openai
+    - api_key: secret string
+    - base_url: string (optional; for Azure OpenAI or compatible proxies)
+    - organization: string (optional)
+    - default_model: string (optional; e.g., "gpt‑4o")
+  - llm.gemini
+    - api_key: secret string
+    - region_or_location: string (optional)
+    - default_model: string (optional; e.g., "gemini‑1.5‑pro")
+  - llm.llama3_onprem
+    - base_url: string (required)
+    - api_style: enum [openai, ollama, vllm, custom] (default openai)
+    - auth_token: secret string (optional)
+    - default_model: string (optional; e.g., "llama3:8b")
+  - embedding.openai
+    - api_key: secret string
+    - base_url: string (optional; Azure/OpenAI‑compatible)
+    - default_model: string (optional; e.g., "text‑embedding‑3‑small")
+    - expected_dimension: integer (optional; for consumer validation)
+  - embedding.generic
+    - base_url: string (required)
+    - api_style: enum [openai, custom] (default openai)
+    - auth_token or api_key: secret string (required)
+    - default_model: string (optional)
+
+Validation: Define schemas using strong types (e.g., Pydantic) with per‑field validation and cross‑field constraints (e.g., base_url required for on‑prem types; api_key required for cloud providers).
+
+## 4. Data Model (Persistence)
+
+- Tables (minimum)
+  - ai_model
+    - id, name, type, category, description, tags (JSONB/array), tenant_id, owner_id,
+      is_enabled, created_at, updated_at, created_by, updated_by
+  - ai_model_config
+    - ai_model_id (FK), config_encrypted (bytes/blob), config_schema_version (string),
+      redaction_map (JSON), updated_at
+  - audit_log (shared)
+
+Constraints
+- Unique (tenant_id, name)
+- FK with cascade delete from ai_model → ai_model_config
+- Soft delete on ai_model (deleted_at nullable) to preserve history; hard delete only via admin tooling
+
+## 5. APIs (HTTP, OpenAPI 3)
+
+- POST /ai-models
+  - Create a model connection; validate schema; encrypt and store secrets; return created resource with redacted config
+- GET /ai-models
+  - List model connections for current tenant; filter by category/type/enabled/tag; pagination and sorting
+- GET /ai-models/{id}
+  - Fetch single model connection; redact secrets
+- PATCH /ai-models/{id}
+  - Partial update; allow secret rotation by passing new values; unchanged secrets remain intact
+- DELETE /ai-models/{id}
+  - Soft delete; deny if referenced by active agents unless forced with policy
+- POST /ai-models/{id}/enable
+- POST /ai-models/{id}/disable
+- GET /ai-models/types
+  - Return dynamically discovered supported types (built‑in and plugin) with versioned config JSON Schemas, UI hints (labels, placeholders, secret flags), category, type slug, and source (builtin|plugin)
+- POST /ai-models/{id}/test-connection
+  - Perform short‑lived connectivity/auth check. Default behavior avoids billable inference:
+    - For OpenAI/Gemini: attempt a non‑billable metadata call when available (e.g., list models) or HEAD/health probe
+    - For on‑prem: call health endpoint or a 0‑token/dry‑run if supported
+  - Optionally allow a gated "smoke_inference" flag (disabled by default) that performs a minimal, capped request (e.g., max_tokens=1) for environments where metadata calls are not supported
+
+API Security & Behavior
+- Enforce RBAC permissions: ai_model:create, read, update, delete, test, enable, disable
+- All responses must redact secret fields consistently
+- Rate‑limit test‑connection
+- Idempotency for POST /ai-models via optional idempotency key header
+
+## 6. Service Layer and Connector Interface
+
+- Service responsibilities
+  - Validate requests against per‑type schemas
+  - Normalize configs (e.g., trim strings; default base URLs for well‑known providers)
+  - Encrypt/decrypt secrets for persistence
+  - Redact configs for outbound responses/logs
+  - Invoke connector.test_connection(config) when requested
+  - Expose connector capability metadata for consumers (e.g., supported models, max input tokens, embedding dimensions)
+
+- Connector registry
+  - Map type_slug → connector instance (supports runtime discovery)
+  - Discovery via built‑ins and plugins (e.g., entry_points group "orion.ai_models")
+
+- Connector interface (per type)
+  - validate_config(config) -> None or error list
+  - redact_config(config) -> redacted_config
+  - test_connection(config, timeout_s=10, allow_smoke_inference=False) -> { status: "ok"|"failed", latency_ms, billable: bool, details }
+  - get_json_schema() -> JSON Schema for UI/validation
+  - get_capabilities(config) -> { models?: string[], max_input_tokens?: int, max_output_tokens?: int, embedding_dimensions?: { [model]: int }, api_style?: string }
+
+Implementation notes
+- Timeouts are mandatory; default 10s, configurable per request
+- Connectors must not perform billable inference during test_connection unless explicitly allowed via allow_smoke_inference
+- Capability metadata should be cached with TTL when provider supports listing models; fall back to static hints when not available
+
+## 7. Security, Privacy, and Compliance
+
+- Secrets
+  - Encrypt at rest with a securely managed master key
+  - Require TLS for all remote endpoints where applicable
+  - Do not log secrets; ensure structured logging redacts values
+- Access control
+  - Enforce tenant isolation on all operations
+  - Permissions as per RBAC; admins can manage across departments if policy allows
+- Auditing
+  - Log create/update/delete/enable/disable/test actions with actor, timestamp, and redacted metadata
+- Compliance
+  - Adhere to OWASP ASVS for secret management and sensitive data exposure
+  - Ensure default test paths avoid sending user prompts or data to third‑party providers
+
+## 8. Observability and Reliability
+
+- Metrics
+  - Counters: ai_models_created, ai_models_deleted, test_connection_success, test_connection_failure
+  - Histograms: test_connection_latency_ms by type
+  - Gauges: ai_models_enabled_total by category/type
+- Health
+  - Optional background capability discovery refresh (e.g., list models) with backoff; failures trigger alerts but do not auto‑disable unless configured
+- Error model (examples)
+  - AIMODEL_VALIDATION_ERROR, AIMODEL_SECRET_MISSING, AIMODEL_UNREACHABLE, AIMODEL_AUTH_FAILED, AIMODEL_RATE_LIMITED, AIMODEL_CONFLICT, AIMODEL_NOT_FOUND
+
+## 9. Performance and Limits
+
+- test_connection must complete within configured timeout (default 10s, max 30s)
+- Pagination defaults: limit=20, max=100 on list endpoints
+- Name length <= 128; description <= 1024; tag key/value <= 64
+
+## 10. Compatibility and Extensibility
+
+- Type slugs
+  - Format: "<category>.<provider>" (e.g., "llm.openai", "llm.gemini", "llm.llama3_onprem", "embedding.openai")
+  - Validated against the registry; unknown slugs are rejected
+- Adding a new provider requires
+  - Implementing the connector interface (Section 6)
+  - Publishing a package that registers an entry point (e.g., "orion.ai_models")
+  - Registering the type slug and JSON Schema via the entry point
+  - Providing minimal integration/contract tests for validation/redaction
+  - No changes to the core AI Models service code
+
+## 11. Migrations and Versioning
+
+- Provide initial migrations to create ai_model and ai_model_config tables and indexes
+- Version config schemas with config_schema_version to support evolution
+- Backward‑compatible redaction handling for legacy stored configs
+
+## 12. Testing Requirements
+
+- Unit tests
+  - Schema validation per type (valid and invalid cases)
+  - Redaction behavior (API and logs)
+  - Secret rotation logic
+  - Test‑connection behavior (auth failure, timeout, DNS error); smoke inference gated
+- Integration tests
+  - CRUD lifecycle for each type without contacting real systems (use fakes/mocks)
+  - Optional smoke tests with live sandboxes behind env flags (never in CI by default)
+
+## 13. Acceptance Criteria (MVP)
+
+- Can create, read, update, soft‑delete, enable/disable AI model connections for supported types
+- Secrets are encrypted at rest and redacted in all responses/logs
+- Test‑connection endpoint returns accurate status within timeout and avoids billable inference by default
+- RBAC enforced for all endpoints; tenant isolation verified
+- JSON Schemas exposed for UI form generation per type
+- Registry supports dynamic discovery of plugin connectors; GET /ai-models/types lists both built‑in and plugin types
+- 'type' accepts any registry‑known slug and rejects unknown slugs; 'category' aligns with the registered connector
+
+## 14. Notes on Interaction with Agents and Chatbots
+
+- Agents and Chatbots reference AI Models by id; they must not access or handle raw secrets directly
+- The AI Models module exposes redacted connection metadata and capability hints to help consumers select appropriate models and validate limits (e.g., token caps, embedding dimensions)
+- Consumers may override the model name at runtime if permitted by policy; the connector should validate overrides against provider capabilities when possible
+- Usage metering, prompt/response logging, moderation, and orchestration are handled by higher‑level modules and are out of scope for this document
+
