@@ -1,0 +1,206 @@
+description: Concise requirements for the Agent Tools module (predefined, parameterized tools; some may be dataset‑backed)
+globs:
+  alwaysApply: false
+---
+
+# Agent Tools Module Requirements
+
+Agent Tools are predefined, parameterized capabilities that agents can invoke at runtime. Only the tool definitions and their parameters are persisted; execution is delegated to underlying modules (e.g., Datasets). Tools may reference existing Datasets to perform read‑only operations, but not all tools require a Dataset. The design must be extensible to new tool kinds without changing core logic.
+
+## 1. Scope and Non‑Goals
+
+- In scope
+  - CRUD for Tool definitions (metadata + typed config)
+  - Parameter validation per tool kind/provider
+  - Linking a Tool to one or more existing resources (e.g., a Dataset)
+  - Runtime invocation contract that translates to underlying module operations (e.g., Datasets) with RLS/RBAC enforcement where applicable
+  - Enable/disable lifecycle, audit logs, metrics
+- Non‑goals (MVP)
+  - Storing or managing executable code; tools are predefined in code
+  - Mutating data operations; all data‑plane ops remain read‑only
+  - Secrets or connection handling (owned by Datasources)
+
+## 2. Initial Tool Kinds (MVP)
+
+- sql.select
+  - Purpose: Execute safe, parameterized SELECT against a bound SQL Dataset table
+  - Backing: `dataset.category == sql`
+  - Config (defaults; overridable per invocation):
+    - default_columns: string[] (optional)
+    - max_rows: int (default 500, cap 5000)
+    - query_timeout_s: int (default 15, max 60)
+    - allowed_predicates: string[] (optional allowlist of column names)
+- vector.similarity_search
+  - Purpose: Query top_k most similar vectors with optional metadata filter
+  - Backing: `dataset.category == vector`
+  - Config (defaults; overridable per invocation):
+    - top_k: int (default 10, max 1000)
+    - include_metadata: bool (default true)
+    - include_values: bool (default false)
+    - namespace: string (optional)
+    - allowed_metadata_fields: string[] (optional allowlist)
+    - embed_text_max_chars: int (optional; default 8000)  
+      Note: If invocation includes `text` (no `vector`), the system MUST use a bound embedding model to produce the query vector within this limit.
+
+The module must support adding more tool kinds by registering new validators/adapters.
+
+## 3. Configuration and Validation Model
+
+- Common fields (all tools)
+  - id: UUID (server‑generated)
+  - name: string (unique per tenant)
+  - description: optional string
+  - tags: string[] (optional)
+  - tenant_id: UUID/string
+  - owner_id: UUID/string
+  - kind: enum/string (e.g., "sql.select", "vector.similarity_search")
+  - provider: string (optional; aligns with underlying provider if needed)
+  - is_enabled: boolean (default true)
+  - created_at, updated_at; created_by, updated_by; deleted_at (nullable)
+  - config: JSON (validated per kind/provider)
+  - bindings: JSON (referential info; see below)
+
+- Bindings (JSONB)
+  - A flexible, typed structure allowing zero or more resource references
+  - Format (MVP):
+    - For similarity search tools (required):
+      { resources: [
+          { type: "dataset", id: UUID, role: "vector_index" },
+          { type: "ai_model", id: UUID, role: "embedding_model" }
+        ] }
+    - For SQL select tools (required): { resources: [ { type: "dataset", id: UUID, role: "primary" } ] }
+    - For tools without datasets: { resources: [] } or field omitted
+  - Future: allow additional resource kinds (e.g., datasource) and multiple inputs
+
+- Validation
+  - Implement strong typed schemas (Pydantic) per tool kind/provider
+  - Cross‑field checks (e.g., max_rows bounds, top_k limits)
+  - Ensure binding compatibility (tool kind ↔ required resource roles)
+  - For vector.similarity_search: require roles `vector_index` (dataset.category == vector) and `embedding_model` (ai model providing embeddings)
+
+## 4. Persistence Data Model
+
+- Tables (minimum)
+  - agent_tool
+    - id, name, description, tags (JSONB/array), tenant_id, owner_id,
+      kind, provider, is_enabled, created_at, updated_at, created_by, updated_by, deleted_at
+  - agent_tool_config
+    - tool_id (FK → agent_tool), config_json (JSONB), config_schema_version (string), updated_at
+  - audit_log (shared)
+
+- Constraints
+  - Unique (tenant_id, name)
+  - No separate binding table; references live inside `agent_tool.bindings` JSONB
+  - Soft delete on tools; preserve history in audit log
+
+## 5. Invocation Contract
+
+- API‑level request (polymorphic by kind)
+  - sql.select
+    - body: { columns?: string[], where?: object, params?: object, order_by?: string[], limit?: int, offset?: int }
+  - vector.similarity_search
+    - body: { vector: float[] | null, text?: string, top_k?: int, filter?: object, include_values?: bool, include_metadata?: bool, namespace?: string }
+
+- Behavior
+  - sql.select: no mutations; strictly parameterized; respects dataset RLS
+  - vector.similarity_search:
+    - If `vector` is provided, use it directly (validate dimension vs index)
+    - If `text` is provided (and `vector` not provided), the system MUST:
+      1) Resolve bound `embedding_model` from bindings
+      2) Call the embedding model to embed the text (respecting `embed_text_max_chars`)
+      3) Use the resulting vector to query the bound `vector_index` dataset
+  - Merge invocation overrides with stored defaults; enforce caps/timeouts
+  - Resolve bindings and delegate to the corresponding underlying operation (e.g., Dataset service when bound)
+  - Enforce RBAC and evaluate RLS policies when a bound Dataset is involved; otherwise enforce tool‑level RBAC only
+  - Redact sensitive fields in logs; record audit events
+
+## 6. APIs (HTTP, OpenAPI 3)
+
+- Tool CRUD
+  - POST /agent-tools
+  - GET /agent-tools
+  - GET /agent-tools/{id}
+  - PATCH /agent-tools/{id}
+  - DELETE /agent-tools/{id}
+  - POST /agent-tools/{id}/enable
+  - POST /agent-tools/{id}/disable
+
+- Tool invocation (read‑only)
+  - POST /agent-tools/{id}/invoke
+    - body: kind‑specific payload (see Invocation Contract)
+    - response: kind‑specific result (e.g., rows for SQL; matches for Vector)
+
+- API Security & Behavior
+  - RBAC permissions: tool:create, read, update, delete, enable, disable, invoke
+  - Tenant isolation for all operations
+  - Respect tool.is_enabled and underlying dataset/datasource state
+
+## 7. Service Layer and Adapter Registry
+
+- Responsibilities
+  - Validate tool definitions and bindings
+  - Normalize invocation requests; apply limits and defaults
+  - Enforce RBAC and delegate RLS evaluation via Datasets
+  - Translate tool invocation to dataset operations
+  - Emit metrics and audit logs
+
+- Adapter/registry
+  - Map (kind, provider) → tool adapter with methods:
+    - validate_config(config) -> None | error list
+    - validate_bindings(bindings) -> None | error list
+    - invoke(tool, request, context) -> result
+      - sql.select: delegates to Dataset SQL select service
+      - vector.similarity_search: delegates to Embedding model adapter (to embed) then Dataset Vector query service
+  - Discovery via built‑ins and plugins (e.g., entry_points "orion.agent_tools")
+
+## 8. Security, Privacy, and Compliance
+
+- All data execution occurs via Datasets; secrets remain isolated in Datasources
+- Strict parameterization of SQL via Dataset layer; deny disallowed constructs
+- Input validation and payload size caps; rate limiting per tenant and per tool
+- RLS enforced through bound Datasets; deny by default when policies are absent
+
+## 9. Observability and Reliability
+
+- Metrics
+  - Counters: agent_tool_invocations_total by kind/provider/status
+  - Histograms: agent_tool_latency_ms by kind/provider
+  - Gauges: agent_tool_enabled_total
+- Error model (examples)
+  - TOOL_NOT_FOUND, TOOL_DISABLED, TOOL_ACCESS_DENIED
+  - TOOL_BINDING_INVALID, TOOL_CONFIG_INVALID
+  - SQL_QUERY_TIMEOUT, SQL_SYNTAX_ERROR_MASKED
+  - VECTOR_DIMENSION_MISMATCH, VECTOR_INDEX_NOT_FOUND
+
+## 10. Performance and Limits (MVP defaults)
+
+- Pagination defaults for SQL: limit=20, max=100; max_rows cap from config applies
+- Vector top_k default=10, max=1000
+- Request body size cap: 5 MB; server‑side timeouts aligned with Dataset limits
+
+## 11. Migrations and Versioning
+
+- Provide initial migrations for agent_tool and agent_tool_config (no separate binding table)
+- Version tool config with config_schema_version to support evolution
+- Backward‑compatible invocation behavior when feasible
+
+## 12. Testing and Acceptance Criteria (MVP)
+
+- Unit tests
+  - Config validation per tool kind/provider
+  - Binding compatibility checks (kind ↔ dataset category)
+  - Limit/timeout normalization
+- Integration tests
+  - CRUD lifecycle; enable/disable behavior
+  - sql.select invokes Dataset SQL SELECT on the bound table (when bound) with RLS applied
+  - vector.similarity_search:
+    - When `vector` is provided: queries bound Vector Dataset with filters/caps
+    - When `text` is provided: uses bound Embedding Model to embed, then queries the bound Vector Dataset; validates dimension
+  - RBAC enforced; tenant isolation verified
+
+- Acceptance
+  - Can create and manage tools of kinds: sql.select and vector.similarity_search
+  - Can bind a similarity search tool to a Vector Dataset and an Embedding Model and invoke using either a raw vector or text
+  - Tools without datasets are also supported
+  - Invocations are read‑only, respect RLS/RBAC, and adhere to configured limits
+

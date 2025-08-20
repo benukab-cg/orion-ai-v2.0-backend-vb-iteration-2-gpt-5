@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from app.datasources.controllers import router as datasources_router
 from app.datasets.controllers import router as datasets_router
 from app.ai_models.controllers import router as ai_models_router
+from app.agent_tools.controllers import router as agent_tools_router
 
 
 app = FastAPI(
@@ -14,4 +15,5 @@ app = FastAPI(
 app.include_router(datasources_router, prefix="/api/v1")
 app.include_router(datasets_router, prefix="/api/v1")
 app.include_router(ai_models_router, prefix="/api/v1")
+app.include_router(agent_tools_router, prefix="/api/v1")
 

@@ -46,6 +46,14 @@ def get_current_principal() -> Principal:  # Stub for now
         "dataset_data:query",
         "dataset_data:get",
         "dataset_data:presign_get",
+        # Agent Tools (development default: full access)
+        "tool:create",
+        "tool:read",
+        "tool:update",
+        "tool:delete",
+        "tool:enable",
+        "tool:disable",
+        "tool:invoke",
     })
 
 
