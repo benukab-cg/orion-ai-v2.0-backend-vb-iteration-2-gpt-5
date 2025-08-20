@@ -163,6 +163,37 @@ class OpenAIEmbeddingsConnector(AIModelConnector):
         finally:
             client.close()
 
+    def embed_texts(self, config: dict, texts: list[str]) -> list[list[float]]:
+        base_url: str = (config.get("base_url") or "https://api.openai.com/v1").rstrip("/")
+        api_key: str = config["api_key"]
+        model: str = config.get("default_model") or "text-embedding-3-small"
+        api_version: Optional[str] = config.get("api_version")
+        extra_headers: dict[str, str] = config.get("extra_headers") or {}
+        extra_query: dict[str, str] = config.get("extra_query_params") or {}
+
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        headers.update({k: v for k, v in extra_headers.items() if k.lower() != "authorization"})
+
+        client = httpx.Client(timeout=30)
+        try:
+            body = {"model": model, "input": texts}
+            if "azure.com" in base_url:
+                url = f"{base_url}/deployments/{model}/embeddings"
+                params = {"api-version": api_version} | extra_query
+                resp = client.post(url, headers=headers, params=params, json=body)
+            else:
+                url = f"{base_url}/embeddings"
+                resp = client.post(url, headers=headers, params=extra_query, json=body)
+            if not (200 <= resp.status_code < 300):
+                raise AIModelValidationError(f"OpenAI embeddings failed with status {resp.status_code}")
+            data = resp.json()
+            arr = [item.get("embedding") for item in data.get("data", [])]
+            if not arr or not isinstance(arr[0], list):
+                raise AIModelValidationError("Malformed embeddings response")
+            return arr
+        finally:
+            client.close()
+
 
 _OPENAI_EMBEDDINGS_JSON_SCHEMA: Dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",

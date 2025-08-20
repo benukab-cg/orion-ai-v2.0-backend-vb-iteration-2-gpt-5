@@ -45,5 +45,13 @@ class AIModelConnector:
         """
         return {}
 
+    # Optional inference interfaces (implemented by specific categories)
+    def embed_texts(self, config: dict, texts: list[str]) -> list[list[float]]:
+        """Return embeddings for the given texts. Implemented by embedding model connectors.
+
+        Default behavior is to raise NotImplementedError.
+        """
+        raise NotImplementedError
+
 
 
