@@ -53,5 +53,12 @@ class AIModelConnector:
         """
         raise NotImplementedError
 
+    def chat(self, config: dict, *, messages: list[dict], params: dict | None = None) -> dict:
+        """Perform chat/completions with an LLM. Implemented by LLM connectors.
+
+        Expected return: { output: str|object, tokens?: {input:int, output:int, total?:int}, finish_reason?: str }
+        """
+        raise NotImplementedError
+
 
 

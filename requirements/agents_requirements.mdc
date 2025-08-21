@@ -1,0 +1,166 @@
+---
+description: Concise requirements for the Agents module (LangGraph single agents now; networks later)
+globs:
+  alwaysApply: false
+---
+
+# Agents Module Requirements
+
+Agents are LangGraph-based autonomous workers that execute tasks using an LLM and optional Tools. In this milestone, only standalone LangGraph Agents are delivered. Future phases will introduce Agent Networks (Agent Swarms and Supervised Agents) built atop the same foundations.
+
+## 1. Scope and Non‑Goals
+
+- In scope (MVP)
+  - Define, store, and run standalone LangGraph Agents
+  - Bind each Agent to exactly one LLM connection from `ai_models`
+  - Optional tool usage via `agent_tools` (zero or more tools per Agent)
+  - Prompt template management per Agent (system/instructions + variables)
+  - HTTP APIs for CRUD, enable/disable, validate, and invoke
+  - RBAC, tenant isolation, observability, and audit
+- Non‑goals (MVP)
+  - Agent Networks (Swarms, Supervisor patterns) — deferred
+  - Long‑lived memory or chat thread storage (owned by Chatbots module)
+  - Tool creation/validation (owned by `agent_tools`)
+  - AI provider secrets and connection handling (owned by `ai_models`)
+
+## 2. Agent Definition Model
+
+- Common fields
+  - id: UUID (server‑generated)
+  - name: string (unique per tenant)
+  - description: optional string
+  - tags: string[] (optional)
+  - tenant_id: UUID/string; owner_id: UUID/string
+  - type: enum/string (MVP: "langgraph.single")
+  - ai_model_id: UUID (FK → `ai_model.id`, category == llm)
+  - is_enabled: boolean (default true)
+  - created_at, updated_at; created_by, updated_by; deleted_at (nullable)
+
+- Config (JSONB)
+  - prompt_template: string (system/instructions; templated)
+  - input_schema: JSON Schema (optional; validates invocation `variables`)
+  - tool_policy:
+    - allowed_tools: UUID[] (empty means no tools; null means any bound tools)
+    - mode: enum [auto, manual] (default auto)
+    - max_tool_calls: int (default 8, max 32)
+  - llm_params: { model?: string, temperature?: number, top_p?: number, max_tokens?: int, stop?: string[], response_format?: object }
+  - runtime_limits: { max_steps: int (default 16, max 64), max_duration_s: int (default 60, max 300) }
+  - streaming_enabled: boolean (default true)
+
+- Bindings (JSONB)
+  - tools: UUID[] (references `agent_tool.id`); may be empty
+
+Notes
+- Prompt templates may use placeholders like `{{input}}` and `{{variables.*}}`.
+- Validation must reject Agents that reference disabled or cross‑tenant resources.
+
+## 3. Persistence Data Model
+
+- Tables (minimum)
+  - agent
+    - id, name, description, tags, tenant_id, owner_id, type, ai_model_id,
+      is_enabled, created_at, updated_at, created_by, updated_by, deleted_at,
+      bindings (JSONB)
+  - agent_config
+    - agent_id (FK → agent), config_json (JSONB), config_schema_version (string), updated_at
+
+- Constraints
+  - Unique (tenant_id, name)
+  - FK agent.ai_model_id → ai_model.id (on delete: restrict)
+  - Soft delete for `agent`; preserve history in audit log
+
+## 4. Runtime and Invocation Contract
+
+- LangGraph runtime
+  - MVP uses a single‑agent graph: prompt → LLM → optional tool loop → finish
+  - Stop on: `max_steps`, `max_duration_s`, `no_tool_calls`, or `finish` signal
+
+- Invocation API (request)
+  - body: {
+      input?: string,
+      variables?: object,
+      messages?: Array<{ role: "user"|"assistant"|"system"|"tool", content: any, name?: string }>,
+      tool_overrides?: { allowed_tools?: UUID[], mode?: "auto"|"manual", max_tool_calls?: int },
+      llm_overrides?: { model?: string, temperature?: number, top_p?: number, max_tokens?: int, stop?: string[] },
+      stream?: boolean (default: agent.streaming_enabled)
+    }
+
+- Behavior
+  - Render `prompt_template` with `input` and `variables`
+  - Construct LangGraph state (system + optional prior `messages`)
+  - If tools are allowed and present, enable tool‑calling with `agent_tools` adapters
+  - Enforce `runtime_limits` and `tool_policy`; deny unbound tools
+  - LLM invocation uses the bound `ai_models` connector; secrets remain isolated there
+  - Streaming responses supported (SSE/chunked tokens) when `stream=true`
+
+- Response (non‑stream)
+  - { output: string|object, steps: int, tool_calls: int, tokens: { input: int, output: int }, finish_reason: string, logs?: object }
+
+## 5. APIs (HTTP, OpenAPI 3)
+
+- CRUD
+  - POST /agents
+  - GET /agents
+  - GET /agents/{id}
+  - PATCH /agents/{id}
+  - DELETE /agents/{id}
+  - POST /agents/{id}/enable
+  - POST /agents/{id}/disable
+
+- Validation and execution
+  - POST /agents/{id}/validate (schema/bindings/limits check)
+  - POST /agents/{id}/invoke (see Invocation Contract)
+
+- API Security
+  - RBAC: agent:create, read, update, delete, enable, disable, validate, invoke
+  - Tenant isolation on all operations
+
+## 6. Security and Policy
+
+- Enforce RBAC at Agent level; enforce tool RBAC and Dataset RLS when tools touch data
+- Do not store or log provider secrets; LLM calls go through `ai_models`
+- Redact sensitive request fields in logs; rate‑limit invocations per tenant
+- Deny invocation when Agent or any required binding is disabled or cross‑tenant
+
+## 7. Observability and Reliability
+
+- Metrics
+  - Counters: agent_invocations_total by agent/type/status
+  - Histograms: agent_latency_ms; tokens_in, tokens_out
+  - Gauges: agents_enabled_total
+- Audit: create/update/delete/enable/disable/invoke with actor and redacted metadata
+- Errors (examples): AGENT_NOT_FOUND, AGENT_DISABLED, AGENT_ACCESS_DENIED, AGENT_CONFIG_INVALID, AGENT_TOOL_DENIED, AGENT_LIMIT_EXCEEDED, LLM_PROVIDER_ERROR
+
+## 8. Performance and Limits (Defaults)
+
+- max_steps: 16 (cap 64); max_duration_s: 60 (cap 300)
+- tool_policy.max_tool_calls: 8 (cap 32)
+- request body size cap: 1 MB; prompt_template length <= 32 KB
+- Streaming enabled by default; server‑side timeouts aligned with `ai_models`
+
+## 9. Testing and Acceptance Criteria (MVP)
+
+- Unit tests
+  - Prompt rendering with variables; validation failures on missing variables
+  - Tool allow/deny and max_tool_calls enforcement
+  - Runtime limits: steps and duration
+- Integration tests
+  - CRUD lifecycle; enable/disable behavior
+  - Invoke Agent without tools → single LLM response
+  - Invoke Agent with a bound tool (e.g., `sql.select` or `vector.similarity_search`) → tool call executes via `agent_tools`; RLS/RBAC enforced
+  - Tenant isolation and RBAC checks
+- Acceptance
+  - Can create an Agent with prompt, bind LLM from `ai_models`, and optionally bind tools from `agent_tools`
+  - Can validate and successfully invoke; receives response (streaming and non‑streaming)
+  - Tool calls are constrained by policy; disabled or unbound tools are rejected
+
+## 10. Extensibility and Future Work
+
+- Agent Networks (post‑MVP)
+  - Types: `langgraph.swarm`, `langgraph.supervised`
+  - Network definition language persisted similarly to `agent_config`
+  - Each network exposes a uniform invocation interface, allowing composition (an Agent can call a Network as a tool‑like unit)
+- Additional runtime features
+  - Guardrails/moderation hooks; retry/backoff; tool‑choice strategies; response schemas
+  - Optional short‑term memory via Chatbot threads; long‑term memory via dataset tools
+

@@ -54,6 +54,15 @@ def get_current_principal() -> Principal:  # Stub for now
         "tool:enable",
         "tool:disable",
         "tool:invoke",
+        # Agents (development default: full access)
+        "agent:create",
+        "agent:read",
+        "agent:update",
+        "agent:delete",
+        "agent:enable",
+        "agent:disable",
+        "agent:validate",
+        "agent:invoke",
     })
 
 

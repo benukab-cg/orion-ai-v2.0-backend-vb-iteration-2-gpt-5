@@ -10,6 +10,8 @@ from app.core.config import get_settings
 from app.core.database import Base
 from app.datasources import models as ds_models  # ensure models are imported for autogenerate
 from app.ai_models import models as ai_models_models  # ensure models imported for autogenerate
+from app.agent_tools import models as agent_tools_models  # noqa: F401
+from app.agents import models as agents_models  # noqa: F401
 
 
 # this is the Alembic Config object, which provides access to the values within the .ini file in use.

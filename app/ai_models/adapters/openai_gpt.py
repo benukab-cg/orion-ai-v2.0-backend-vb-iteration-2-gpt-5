@@ -158,6 +158,52 @@ class OpenAIConnector(AIModelConnector):
         finally:
             client.close()
 
+    # LLM chat interface
+    def chat(self, config: dict, *, messages: list[dict], params: dict | None = None) -> dict:
+        base_url: str = (config.get("base_url") or "https://api.openai.com/v1").rstrip("/")
+        api_key: str = config["api_key"]
+        model: str = (params or {}).get("model") or config.get("default_model") or "gpt-4o-mini"
+        api_version: Optional[str] = config.get("api_version")
+        extra_headers: dict[str, str] = config.get("extra_headers") or {}
+        extra_query: dict[str, str] = config.get("extra_query_params") or {}
+
+        body = {
+            "model": model,
+            "messages": messages,
+            "temperature": (params or {}).get("temperature", 0),
+            "top_p": (params or {}).get("top_p", 1),
+            "max_tokens": (params or {}).get("max_tokens", 512),
+            "stop": (params or {}).get("stop"),
+        }
+
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        headers.update({k: v for k, v in extra_headers.items() if k.lower() != "authorization"})
+
+        client = httpx.Client(timeout=(params or {}).get("request_timeout_s", 60))
+        try:
+            if "azure.com" in base_url:
+                url = f"{base_url}/deployments/{model}/chat/completions"
+                params_q = {"api-version": api_version} | extra_query
+                resp = client.post(url, headers=headers, params=params_q, json=body)
+            else:
+                url = f"{base_url}/chat/completions"
+                resp = client.post(url, headers=headers, params=extra_query, json=body)
+            if not (200 <= resp.status_code < 300):
+                raise AIModelValidationError(f"OpenAI chat failed with status {resp.status_code}")
+            data = resp.json()
+            message_obj = data.get("choices", [{}])[0].get("message", {})
+            content = message_obj.get("content")
+            usage = data.get("usage", {})
+            tokens = {
+                "input": usage.get("prompt_tokens", 0),
+                "output": usage.get("completion_tokens", 0),
+                "total": usage.get("total_tokens", 0),
+            }
+            finish = data.get("choices", [{}])[0].get("finish_reason", "stop")
+            return {"output": content, "tokens": tokens, "finish_reason": finish}
+        finally:
+            client.close()
+
 
 _OPENAI_JSON_SCHEMA: Dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
