@@ -4,6 +4,8 @@ from typing import Any, Optional
 
 from app.agent_tools.adapters import registry
 from app.agent_tools.adapters.base import AgentToolAdapter
+from langchain_core.tools import StructuredTool
+from typing import Optional, List
 from app.agent_tools.exceptions import AgentToolBindingInvalid, AgentToolConfigInvalid, AgentToolAdapterNotFound
 from app.datasets.services import DatasetService
 from app.ai_models.models import AIModel
@@ -88,6 +90,36 @@ class VectorSimilaritySearchAdapter(AgentToolAdapter):
         if not vectors or not isinstance(vectors[0], list):
             raise AgentToolConfigInvalid("Embedding response malformed")
         return vectors[0]
+
+    def as_langchain_tool(self, *, tool: dict, context: dict) -> StructuredTool:
+        description = (tool.get("description") or "Vector similarity search").strip()
+        tool_id: str = tool["id"]
+
+        def _call(
+            text: Optional[str] = None,
+            vector: Optional[List[float]] = None,
+            top_k: Optional[int] = None,
+            filter: Optional[dict] = None,
+            include_values: Optional[bool] = None,
+            include_metadata: Optional[bool] = None,
+            namespace: Optional[str] = None,
+        ):
+            payload = {
+                "text": text,
+                "vector": vector,
+                "top_k": top_k,
+                "filter": filter,
+                "include_values": include_values,
+                "include_metadata": include_metadata,
+                "namespace": namespace,
+            }
+            from app.agent_tools.services import AgentToolService
+            svc = AgentToolService(context["db"], context["principal"])
+            return svc.invoke(tool_id, {k: v for k, v in payload.items() if v is not None})
+
+        name_base = tool.get("name") or f"tool_{tool_id[:8]}"
+        safe_name = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in name_base)[:63]
+        return StructuredTool.from_function(name=safe_name, description=description, func=_call)
 
 
 registry.register(VectorSimilaritySearchAdapter.kind, VectorSimilaritySearchAdapter())

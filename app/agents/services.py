@@ -313,10 +313,10 @@ class AgentService:
             base_url=base_url,
         )
 
-        # Wrap our bound Agent Tools as LangChain tools
+        # Wrap our bound Agent Tools via their adapters (no per-kind ifs here)
         from langchain_core.tools import StructuredTool
-        import json as _json
-        from app.agent_tools.services import AgentToolService
+        from app.agent_tools.adapters import registry as tool_registry
+        from app.agent_tools.services import AgentToolService  # ensure name available if adapters import indirectly
 
         svc = AgentToolService(self.db, self.principal)
         tools: list[StructuredTool] = []
@@ -349,76 +349,29 @@ class AgentService:
             for obj in self.db.execute(stmt).scalars().all():
                 tool_meta[str(obj.id)] = obj
 
-        from typing import Optional, List
-
         def _make_tool(tid: str):
             obj = tool_meta.get(tid)
-            base_name = (obj.name if obj and obj.name else f"tool_{tid[:8]}")
-            safe_name = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in base_name)[:63]
-            # Description
-            if obj and obj.description and obj.description.strip():
-                desc = obj.description.strip()
-            else:
-                base = (obj.kind if obj else "tool") or "tool"
-                desc = f"{base} tool" + (f" ({obj.provider})" if obj and obj.provider else "")
-
-            if obj and obj.kind == "sql.select":
-                def _call_sql(
-                    columns: Optional[List[str]] = None,
-                    where: Optional[dict] = None,
-                    params: Optional[dict] = None,
-                    order_by: Optional[List[str]] = None,
-                    limit: Optional[int] = None,
-                    offset: Optional[int] = None,
-                ):
-                    payload = {k: v for k, v in {
-                        "columns": columns,
-                        "where": where,
-                        "params": params,
-                        "order_by": order_by,
-                        "limit": limit,
-                        "offset": offset,
-                    }.items() if v is not None}
-                    return svc.invoke(tid, payload)
-
-                return StructuredTool.from_function(name=safe_name, description=desc, func=_call_sql)
-
-            if obj and obj.kind == "vector.similarity_search":
-                def _call_vec(
-                    text: Optional[str] = None,
-                    vector: Optional[List[float]] = None,
-                    top_k: Optional[int] = None,
-                    filter: Optional[dict] = None,
-                    include_values: Optional[bool] = None,
-                    include_metadata: Optional[bool] = None,
-                    namespace: Optional[str] = None,
-                ):
-                    payload = {k: v for k, v in {
-                        "text": text,
-                        "vector": vector,
-                        "top_k": top_k,
-                        "filter": filter,
-                        "include_values": include_values,
-                        "include_metadata": include_metadata,
-                        "namespace": namespace,
-                    }.items() if v is not None}
-                    return svc.invoke(tid, payload)
-
-                return StructuredTool.from_function(name=safe_name, description=desc, func=_call_vec)
-
-            def _call_generic(payload: dict | str | None = None):
-                args = payload
-                if isinstance(args, str):
-                    try:
-                        args = _json.loads(args)
-                    except Exception:
-                        args = {}
-                return svc.invoke(tid, args or {})
-
-            return StructuredTool.from_function(name=safe_name, description=desc, func=_call_generic)
+            if not obj:
+                return None
+            adapter = tool_registry.get(obj.kind, obj.provider)
+            if not adapter:
+                return None
+            # Build context for adapter
+            ctx = {"db": self.db, "principal": self.principal, "settings": self.settings}
+            # adapter.as_langchain_tool expects the full tool dict like our service returns
+            tool_dict = {
+                "id": obj.id,
+                "name": obj.name,
+                "description": obj.description,
+                "bindings": obj.bindings,
+                "config": obj.config.config_json,
+            }
+            return adapter.as_langchain_tool(tool=tool_dict, context=ctx)
 
         for tid in tool_ids:
-            tools.append(_make_tool(tid))
+            t = _make_tool(tid)
+            if t is not None:
+                tools.append(t)
 
         # Create the prebuilt ReAct agent
         agent_graph = create_react_agent(

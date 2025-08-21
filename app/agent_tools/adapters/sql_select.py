@@ -4,6 +4,8 @@ from typing import Any
 
 from app.agent_tools.adapters import registry
 from app.agent_tools.adapters.base import AgentToolAdapter
+from langchain_core.tools import StructuredTool
+from typing import Optional, List
 from app.agent_tools.exceptions import AgentToolBindingInvalid
 from app.datasets.services import DatasetService
 
@@ -55,6 +57,37 @@ class SqlSelectAdapter(AgentToolAdapter):
         # Delegate to dataset SQL select
         ds_service = DatasetService(context["db"], context["principal"])
         return ds_service.sql_select(primary["id"], query_spec)
+
+    def as_langchain_tool(self, *, tool: dict, context: dict) -> StructuredTool:
+        resources = (tool.get("bindings") or {}).get("resources", [])
+        primary = next((r for r in resources if r.get("role") == "primary" and r.get("type") == "dataset"), None)
+        description = (tool.get("description") or "SQL Select tool").strip()
+        tool_id: str = tool["id"]
+
+        def _call(
+            columns: Optional[List[str]] = None,
+            where: Optional[dict] = None,
+            params: Optional[dict] = None,
+            order_by: Optional[List[str]] = None,
+            limit: Optional[int] = None,
+            offset: Optional[int] = None,
+        ):
+            payload = {
+                "columns": columns,
+                "where": where,
+                "params": params,
+                "order_by": order_by,
+                "limit": limit,
+                "offset": offset,
+            }
+            # Delegate via context service to enforce RLS and RBAC
+            from app.agent_tools.services import AgentToolService
+            svc = AgentToolService(context["db"], context["principal"])
+            return svc.invoke(tool_id, {k: v for k, v in payload.items() if v is not None})
+
+        name_base = tool.get("name") or f"tool_{tool_id[:8]}"
+        safe_name = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in name_base)[:63]
+        return StructuredTool.from_function(name=safe_name, description=description, func=_call)
 
 
 registry.register(SqlSelectAdapter.kind, SqlSelectAdapter())
