@@ -440,5 +440,115 @@ class AgentService:
                     break
         return {"output": output, "tokens": {}, "finish_reason": "stop", "steps": 1, "tool_calls": tool_call_count}
 
+    # Builder for LangChain/LangGraph agent instances (for composition in networks)
+    def build_langchain_agent(self, agent_id: str, *, extra_tools: list | None = None, name: str | None = None):
+        obj = self._get_owned(agent_id)
+        if not obj.is_enabled:
+            raise AgentDisabled()
+
+        # Prepare LLM client
+        llm_model = self._ensure_llm_model(obj.ai_model_id, ensure_enabled=True)
+        connector = ai_model_registry.get(llm_model.type)
+        if connector is None:
+            raise AgentConfigInvalid("LLM connector not implemented")
+        cfg = decrypt_config(llm_model.config.config_encrypted)
+
+        from langchain_openai import ChatOpenAI
+        chat = ChatOpenAI(
+            model=(obj.config.config_json.get("llm_params") or {}).get("model") or cfg.get("default_model") or "gpt-4o-mini",
+            temperature=float((obj.config.config_json.get("llm_params") or {}).get("temperature", 0)),
+            api_key=cfg.get("api_key"),
+            base_url=cfg.get("base_url"),
+        )
+
+        # Build bound tools using the same adapter mechanism
+        from langchain_core.tools import StructuredTool
+        from app.agent_tools.adapters import registry as tool_registry
+        from app.agent_tools.services import AgentToolService
+
+        svc = AgentToolService(self.db, self.principal)
+        tools: list[StructuredTool] = []
+        bindings = obj.bindings or {}
+        bound_ids = [str(t) for t in (bindings.get("tools") or [])]
+        if bound_ids:
+            from sqlalchemy import and_, select
+            stmt = select(AgentTool).where(
+                and_(
+                    AgentTool.tenant_id == self.principal.tenant_id,
+                    AgentTool.deleted_at.is_(None),
+                    AgentTool.id.in_(bound_ids),
+                )
+            )
+            tool_meta: dict[str, AgentTool] = {str(row.id): row for row in self.db.execute(stmt).scalars().all()}
+
+            def _make_tool(tid: str):
+                obj_t = tool_meta.get(tid)
+                if not obj_t:
+                    return None
+                adapter = tool_registry.get(obj_t.kind, obj_t.provider)
+                if not adapter:
+                    return None
+                ctx = {"db": self.db, "principal": self.principal, "settings": self.settings}
+                tool_dict = {
+                    "id": obj_t.id,
+                    "name": obj_t.name,
+                    "description": obj_t.description,
+                    "bindings": obj_t.bindings,
+                    "config": obj_t.config.config_json,
+                }
+                return adapter.as_langchain_tool(tool=tool_dict, context=ctx)
+
+            for tid in bound_ids:
+                t = _make_tool(tid)
+                if t is not None:
+                    tools.append(t)
+
+        if extra_tools:
+            tools.extend(extra_tools)
+
+        # Prompt
+        base_prompt = (obj.config.config_json or {}).get("prompt_template") or "You are a helpful AI agent."
+        # If handoff tools are present, augment the prompt to encourage automatic transfer
+        handoff_tools = []
+        try:
+            for t in (extra_tools or []):
+                # Decorated tools usually have .name and .description
+                tname = getattr(t, "name", None) or getattr(getattr(t, "args_schema", None), "__name__", None)
+                tdesc = getattr(t, "description", None) or "Transfer conversation to a more suitable specialist agent."
+                if isinstance(tname, str) and tname.startswith("transfer_to_"):
+                    handoff_tools.append((tname, tdesc))
+        except Exception:
+            handoff_tools = []
+
+        if handoff_tools:
+            lines = [
+                "You are part of a multi-agent swarm.",
+                "If the user's request is better handled by a specialized agent, immediately transfer using the appropriate tool and include the user's last question in the transfer context.",
+                "Prefer transferring over attempting to answer outside your specialization.",               
+                "Available transfer tools:",
+            ]
+            for tname, tdesc in handoff_tools:
+                lines.append(f"- {tname}: {tdesc}")
+            lines.append("After transferring, do not ask the destination agent to respond; the destination agent will directly answer the user based on the forwarded context.")
+            lines.append("CRITICAL RULE: You MUST make ONLY ONE tool call per turn. NEVER make multiple tool calls in the same response.")
+            lines.append("If the user asks about multiple topics (like 'cars and houses'), you MUST:")
+            lines.append("1. Either choose the MOST RELEVANT single specialist to transfer to")
+            lines.append("2. OR handle the multi-topic request yourself without transferring")
+            lines.append("3. NEVER call multiple transfer tools simultaneously")
+            lines.append("Multiple simultaneous transfers will cause system errors and must be avoided.")
+            prompt = base_prompt + "\n\n" + "\n".join(lines)
+            print(prompt)
+        else:
+            prompt = base_prompt
+
+        from langgraph.prebuilt import create_react_agent
+        built = create_react_agent(
+            model=chat,
+            tools=tools,
+            prompt=prompt,
+            name=name or obj.name or obj.id,
+        )
+        return built
+
 
 

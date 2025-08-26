@@ -1,0 +1,148 @@
+---
+description: This rule defines the requirements for LangGraph-based agent networks.
+globs:
+alwaysApply: false
+---
+
+# Agent Networks (LangGraph)
+
+This document specifies concise requirements for defining, storing, executing, and managing agent networks built with LangGraph. Agent networks must compose existing agents defined and managed by the `app/agents` module.
+
+## 1. Scope & Goals
+
+- Compose networks from existing `app/agents` agents; no duplicate agent definitions inside networks.
+- Support multiple architectures (not exclusive): Standalone Agent, Supervised Agents, Agent Swarm; enable custom topologies.
+- Persist network definitions in the database; allow versioning, validation, execution, observability, and secure reuse across the platform (chatbots and triggers).
+
+## 2. Functional Requirements
+
+### 2.1 Network Definition & Persistence
+- Declarative network spec (JSON/YAML) stored in DB, containing:
+  - Metadata: `name`, `slug`, `description`, `type` (standalone | supervised | swarm | custom), `version`, `status` (draft | active | deprecated), `owner`/`project` context.
+  - Nodes: reference existing `Agent` records by `agent_id`; include `node_key`, `role` (e.g., supervisor, worker, router), and per-node `config` (overrides, tools enablement, memory policy).
+  - Edges: `source_node_key` → `target_node_key` with optional `condition`/`routing` expression.
+  - IO schema: input/output contracts and streaming flags.
+- Versioning: immutable versions with clone/publish/deprecate; track changelog.
+- Validation: schema validation, agent existence/compatibility, acyclicity (unless explicitly supported), required roles per architecture.
+
+### 2.2 Build & Runtime
+- Compile network spec to a LangGraph graph at runtime; cache compiled graphs by `network_id:version:config`.
+- Execution APIs: `invoke`, `stream`, `resume`, `cancel`, `status`/`runs list`.
+- Supervised flows: support human-in-the-loop via interrupt/checkpoint nodes; allow approvals/edits.
+- State & memory: configurable per node and network (RAG memory, conversation memory, checkpointers, resumability/idempotency).
+- Tool execution: tools available through composed agents; respect per-run overrides and auth scopes.
+- Error handling: retries with backoff, fallbacks, circuit-breaking, and structured error surfaces.
+
+### 2.3 Composition & Reuse
+- Expose each network as a reusable callable interface (treatable as an Agent) with `invoke/stream` to nest within other networks.
+- Stable input/output schemas to enable composition and chatbot integration.
+- Sub-network integration: any network can be embedded as a node in another network (network-of-networks) using LangGraph subgraphs; support hierarchical compositions.
+- Interface contract: each network publishes a versioned interface descriptor (name, inputs, outputs, streaming support, capabilities) discoverable via API for other networks to bind against.
+- Version binding: parent networks reference child networks by specific version or semver range; changes to child versions require validation of the parent.
+- Dependency safety: detect/forbid cyclic dependencies across network boundaries; provide dependency graph introspection.
+- Architecture-agnostic subnetworks: a subnetwork may be of any architecture type (standalone, supervised, swarm, hierarchical, custom) and can be attached to any parent network type, provided interface compatibility and policy constraints are satisfied.
+
+### 2.4 Integrations
+- Chatbots: networks callable from chatbot threads; propagate citations/knowledge chunks to responses.
+- Triggers (ambient agents): event-driven invocation (e.g., email, webhook) with filter conditions and schedules.
+
+### 2.5 Observability & Audit
+- Persist run records, events, tool IO, intermediate messages, and final outputs.
+- Structured logs/traces with correlation IDs; configurable retention.
+- Cost/latency metrics per node and per run.
+
+### 2.6 Security & Governance
+- Enforce permission checks (create/read/update/delete/execute) via platform permissions model; support row-level security (RLS) for multi-tenancy.
+- Secrets isolation and least-privilege tool/DS access per run; redact sensitive payloads in logs.
+
+## 3. Supported Architectures
+
+- Standalone Agent: single node network backed by a single `app/agents` agent; uniform interface with other networks.
+- Supervised Agents: a supervisor routes/coordinates delegate agents; supports approval/interrupt points and aggregation.
+- Agent Swarm: peer agents with planner/coordinator patterns; routing by skills/policies.
+- Hierarchical Networks: networks composed of sub-networks (supervisors of supervisors) using LangGraph subgraphs and/or tool-calling.
+- Custom: extensible strategy to register new topologies (e.g., hierarchical, map-reduce) without schema breaks.
+- Interoperability rule: any of the above can serve as a subnetwork in any other, with no restrictions beyond interface and security validations.
+
+## 4. API Requirements (FastAPI)
+
+- CRUD: create/read/update/delete networks; clone, validate, publish/deprecate, list/search.
+- Versioning: get specific version, list versions, rollback.
+- Execution: invoke (sync/async), stream tokens, list runs, get run by ID, cancel.
+- Admin/Dev: validate spec, dry-run with synthetic inputs, compile preview.
+- Interfaces: get network interface descriptor; list compatible networks for a given interface; bind/unbind sub-networks.
+
+## 5. Data Model (Concise)
+
+- AGENT_NETWORK: `id`, `name`, `slug`, `type`, `description`, `version`, `status`, `spec_json`, `owner_id`, `created_at`, `updated_at`.
+- AGENT_NETWORK_NODE: `id`, `network_id`, `node_key`, `agent_id` (nullable), `child_network_id` (nullable), `child_network_version` (nullable), `role`, `config_json`.
+- AGENT_NETWORK_EDGE: `id`, `network_id`, `source_node_key`, `target_node_key`, `condition`.
+- AGENT_NETWORK_RUN: `id`, `network_id`, `run_id`, `status`, `input_json`, `output_json`, `events_json`, `started_at`, `completed_at`, `error_json`, `checkpoint`.
+- AGENT_NETWORK_DEPENDENCY: `id`, `parent_network_id`, `child_network_id`, `child_version_range`.
+- AGENT_NETWORK_INTERFACE: `network_id`, `version`, `inputs_schema`, `outputs_schema`, `streaming`, `capabilities`.
+
+```mermaid
+erDiagram
+    AGENT_NETWORK {
+        string Name
+        string Type
+        string Version
+        string Status
+    }
+
+    AGENT {
+        string Name
+    }
+
+    AGENT_NETWORK_NODE {
+        string NodeKey
+        string Role
+    }
+
+    AGENT_NETWORK_EDGE {
+        string SourceNodeKey
+        string TargetNodeKey
+        string Condition
+    }
+
+    AGENT_NETWORK_RUN {
+        string RunId
+        string Status
+    }
+
+    AGENT_NETWORK_DEPENDENCY {
+        string ChildVersionRange
+    }
+
+    AGENT_NETWORK_INTERFACE {
+        string Version
+    }
+
+    AGENT_NETWORK ||--o{ AGENT_NETWORK_NODE : contains
+    AGENT_NETWORK ||--o{ AGENT_NETWORK_EDGE : defines
+    AGENT_NETWORK ||--o{ AGENT_NETWORK_RUN  : has
+    AGENT ||--o{ AGENT_NETWORK_NODE : referencedBy
+    AGENT_NETWORK ||--o{ AGENT_NETWORK_DEPENDENCY : dependsOn
+    AGENT_NETWORK ||--|| AGENT_NETWORK_INTERFACE : publishes
+```
+
+## 6. Validation Rules (Minimum)
+
+- All `agent_id` references exist and are active; AI model/tool prerequisites satisfied.
+- Graph well-formed: node keys unique; edges connect existing nodes; no forbidden cycles; required roles present per `type`.
+- Input/output schemas compatible across edges; supervisor has routing policies.
+
+## 7. Non-Functional Requirements
+
+- Performance: configurable timeouts; concurrency controls; target P95 latency per call and per run.
+- Scalability: horizontal scaling of workers; stateless executors with external state stores.
+- Reliability: resumable runs, idempotent operations, persisted checkpoints.
+- Compatibility: network spec versioning with migration utilities; backward-compatible additions.
+- Testability: deterministic test mode with fixed seeds/mocks; golden-run fixtures.
+
+## 8. Implementation Notes
+
+- Use LangGraph to compile/execute; cache compiled graphs; warm cache on publish.
+- Reuse `app/agents` services/models for agent lookup and tool/model wiring; no duplicate agent config in networks.
+- Use platform-wide schemas from `app/shared/schemas.py` where applicable for IO contract consistency.
+

@@ -766,6 +766,22 @@ httpx = ">=0.25.2"
 orjson = ">=3.10.1"
 
 [[package]]
+name = "langgraph-swarm"
+version = "0.0.11"
+description = "An implementation of a multi-agent swarm using LangGraph"
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "langgraph_swarm-0.0.11-py3-none-any.whl", hash = "sha256:c99a92a4d383a2f5a4db40952a37bfdef0c41b44288fef56b0214056eb6801a0"},
+    {file = "langgraph_swarm-0.0.11.tar.gz", hash = "sha256:8aafc47c849c0e4eb6ea5cdc7791977be67e11b319ff91f8a6ccef0ded1984a4"},
+]
+
+[package.dependencies]
+langchain-core = ">=0.3.40,<0.4.0"
+langgraph = ">=0.3.5"
+
+[[package]]
 name = "langsmith"
 version = "0.4.15"
 description = "Client library to connect to the LangSmith LLM Tracing and Evaluation Platform."
@@ -2429,4 +2445,4 @@ agents = ["langchain-openai"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12,<3.13"
-content-hash = "75d4a40a653b08c5f7a02d7a8e0fe0fb9b9c332028062dfcb42fc9bc9ccf37d4"
+content-hash = "08d3fa66c00272c091a1b0f82c725bebf3c015b1732df0027945ad5c6302fe94"
