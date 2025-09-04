@@ -1,0 +1,196 @@
+---
+description: Concise requirements for the Chatbots module (threads, user scoping, agent-network backed memory)
+globs:
+  alwaysApply: false
+---
+
+# Chatbots Module Requirements
+
+Chatbots provide conversational interfaces that route user prompts to Agent Networks. Each Chatbot binds to one Agent Network (of any supported architecture: standalone, swarm, supervised, hierarchical, or custom). Chatbots own user-visible chat threads and messages and MUST persist the full conversation history (all user and assistant messages) in the database per thread. Conversation memory/state used for reasoning is owned and maintained by the bound Agent Network via LangGraph memory/checkpointing, keyed by the thread identifier.
+
+## 1. Scope and Non‑Goals
+
+- In scope (MVP)
+  - CRUD for Chatbots and user-specific Chat Threads
+  - Message exchange: user → chatbot → agent network; assistant replies stored
+  - Streaming and non‑streaming responses with citations/knowledge chunks propagation
+  - Persist full conversation history in the database per thread
+  - Agent‑network thread memory: pass a stable `thread_id` context; memory lives in Agent Network runtime
+  - RBAC, tenant isolation, observability, audit
+- Non‑goals (MVP)
+  - Implementing agent reasoning/memory internally (delegated to Agent Networks)
+  - Tool or dataset invocation logic (delegated to Agents/Agent Networks/Agent Tools)
+  - Provider secrets/LLM connections (delegated to `ai_models`)
+
+## 2. Functional Requirements
+
+### 2.1 Chatbot Definition & Binding
+- A Chatbot must bind to exactly one Agent Network by `agent_network_id` and specific `version` (or a pinned, immutable published version).
+- The Agent Network may be of any supported type: standalone, supervised, swarm, hierarchical, or custom (as defined in Agent Networks requirements). Compatibility is enforced by the Agent Network interface descriptor.
+- Chatbot metadata: `name`, `slug`, `description`, `is_enabled`, `tenant_id`, `owner_id`, `visibility` (private|org|public optional), `default_title_policy` for new threads.
+
+### 2.2 Chat Threads (User‑Scoped)
+- Users can create multiple threads per Chatbot. Threads are strictly user‑scoped; only the creator (and privileged roles) can access.
+- Each thread is identified by `thread_id` and is the stable key for Agent Network memory/checkpoints.
+- Thread lifecycle: `active` → `archived` (soft archive) → `deleted` (soft delete with retention).
+- Thread attributes: optional title, tags, last_message_at, token usage counters, last_agent_network_run_id.
+
+### 2.3 Messages
+- Persist full conversation history: store all `user` and `assistant` turns for each thread in the database; apply configurable retention policies.
+- Message roles: `user`, `assistant`, `system` (optional), `tool` (optional passthrough from Agent Network events).
+- Store normalized content as structured JSON: supports text blocks and rich parts (images/attachments as references), with size limits.
+- Persist citations/knowledge chunks returned by the Agent Network (document ids, spans, dataset/datasource refs) for UI rendering and audit.
+- Record message‑level telemetry: token counts, latency, error (if any), run correlation id.
+
+### 2.4 Invocation & Memory Contract
+- On user send:
+  - Resolve Chatbot → bound Agent Network and version.
+  - Call Agent Network `invoke`/`stream` with a payload that includes:
+    - `thread_id` (mandatory; used by the network to restore/update memory)
+    - `input` or `messages` (the new user message; prior history is not sent; memory is restored by the network)
+    - optional `variables`/overrides as allowed by the network interface
+  - Do not fetch or replay the entire thread history into the model; state is owned by the Agent Network via its checkpointer.
+- On reply:
+  - Stream tokens to client when requested; persist the final assistant message and metadata.
+  - Save citations/knowledge chunks and the `agent_network_run_id` for traceability.
+
+### 2.5 Streaming, Resume, and Cancel
+- Support server‑sent events (SSE) or chunked transfer for streaming.
+- Support `cancel` to propagate cancellation to the Agent Network run.
+- Support `resume` where the Agent Network exposes resumable checkpoints for interrupted runs.
+
+### 2.6 Search and Organization
+- List and search Chatbots by name/owner/tags with RBAC.
+- List, search, and filter threads by title, updated_at, tags.
+- Export a thread transcript (user/assistant messages and citations) without internal memory state.
+
+### 2.7 Observability & Audit
+- Persist run correlation ids; store minimal structured logs per message and per thread.
+- Emit metrics: latency, token usage, error rates per Chatbot and per Agent Network binding.
+- Full audit for CRUD and message sends with actor and redacted metadata.
+
+### 2.8 Security & Governance
+- Enforce RBAC and tenant isolation for all entities and operations.
+- Thread RLS: creator‑only access by default; admins/support roles via explicit permissions.
+- Redact sensitive content in logs; payload size caps; rate‑limits per tenant/user.
+
+### 2.9 Agentic Memory (LangGraph)
+- Agent Network MUST implement per‑thread agentic memory using LangGraph checkpointers/memory primitives, keyed by `thread_id`.
+- Memory scope: isolated per `(chatbot_id, thread_id, user_id)` unless explicitly shared by policy.
+- Expose memory controls via Chatbots APIs: snapshot, reset/clear, and inspect (summary/metadata only; not full provider internals).
+- Memory must be independent of stored conversation history. Chatbots must not replay entire history to the model; Agent Network restores state from its memory store.
+
+## 3. APIs (HTTP, OpenAPI 3)
+
+- Chatbot CRUD
+  - POST /chatbots
+  - GET /chatbots
+  - GET /chatbots/{id}
+  - PATCH /chatbots/{id}
+  - DELETE /chatbots/{id}
+  - POST /chatbots/{id}/enable
+  - POST /chatbots/{id}/disable
+
+- Threads
+  - POST /chatbots/{id}/threads
+  - GET  /chatbots/{id}/threads
+  - GET  /chatbots/{id}/threads/{thread_id}
+  - PATCH /chatbots/{id}/threads/{thread_id}
+  - DELETE /chatbots/{id}/threads/{thread_id}
+  - POST /chatbots/{id}/threads/{thread_id}/archive
+  - POST /chatbots/{id}/threads/{thread_id}/restore
+
+- Messages & Invocation
+  - POST   /chatbots/{id}/threads/{thread_id}/messages (role=user)
+    - body: { content: blocks[], variables?: object, stream?: boolean }
+  - GET    /chatbots/{id}/threads/{thread_id}/messages
+  - GET    /chatbots/{id}/threads/{thread_id}/messages/{message_id}
+  - GET    /chatbots/{id}/threads/{thread_id}/stream (SSE; last user message triggers)
+  - POST   /chatbots/{id}/threads/{thread_id}/cancel { run_id }
+  - POST   /chatbots/{id}/threads/{thread_id}/resume { run_id }
+
+- Thread Memory
+  - GET    /chatbots/{id}/threads/{thread_id}/memory           (returns summary/metadata)
+  - POST   /chatbots/{id}/threads/{thread_id}/memory/snapshot  (create a labeled snapshot)
+    - body: { label?: string }
+  - POST   /chatbots/{id}/threads/{thread_id}/memory/reset     (clear agentic memory for this thread)
+
+- Exports
+  - GET /chatbots/{id}/threads/{thread_id}/export (transcript + citations)
+
+- API Security
+  - Permissions: chatbot:create, read, update, delete, enable, disable; thread:create, read, update, delete, archive, restore; message:create, read; run:cancel, run:resume
+  - Tenant isolation for all operations
+
+## 4. Data Model (Concise)
+
+- CHATBOT: `id`, `name`, `slug`, `description`, `is_enabled`, `tenant_id`, `owner_id`, `visibility`, `agent_network_id`, `agent_network_version`, `created_at`, `updated_at`.
+- CHAT_THREAD: `id`, `chatbot_id`, `user_id`, `title`, `status` (active|archived|deleted), `tags` (JSONB), `last_message_at`, `token_usage` (agg), `last_run_id`, `created_at`, `updated_at`, `deleted_at`.
+- CHAT_MESSAGE: `id`, `thread_id`, `role` (user|assistant|system|tool), `content_json`, `citations_json`, `attachments_json`, `run_id`, `token_counts_json`, `latency_ms`, `error_json`, `created_at`.
+
+```mermaid
+erDiagram
+    CHATBOT {
+        string Name
+        string AgentNetworkId
+        string AgentNetworkVersion
+    }
+
+    CHAT_THREAD {
+        string Title
+        string Status
+    }
+
+    CHAT_MESSAGE {
+        string Role
+        string RunId
+    }
+
+    USER {
+        string Name
+    }
+
+    AGENT_NETWORK {
+        string Name
+        string Version
+    }
+
+    CHATBOT ||--o{ CHAT_THREAD : has
+    CHAT_THREAD ||--o{ CHAT_MESSAGE : contains
+    USER ||--o{ CHAT_THREAD : owns
+    AGENT_NETWORK ||--o{ CHATBOT : boundBy
+```
+
+## 5. Invocation Contract (Chatbot ↔ Agent Network)
+
+- Request (to Agent Network)
+  - { thread_id: UUID/string, input?: string, messages?: [latest user turn only], variables?: object, stream?: boolean }
+- Behavior
+  - Agent Network must restore state/memory using `thread_id` via its checkpointer/memory policy.
+  - Chatbot does not replay full history; it only sends the new user input and thread context.
+  - Observability: include correlation id and chatbot/thread metadata in the Agent Network call context.
+- Response (non‑stream)
+  - { output: string|blocks[], citations?: object[], run_id: string, tokens?: { input: int, output: int }, finish_reason: string, logs?: object }
+
+## 6. Validation Rules (Minimum)
+
+- Chatbot must bind to an existing, active Agent Network version; deny invocation if disabled/deprecated.
+- Threads must belong to the requesting user and the Chatbot; enforce RBAC/RLS on all reads/writes.
+- Message payloads validated for size and content schema; attachments referenced by secure URLs/ids.
+- Streaming only when Agent Network supports streaming in its interface descriptor.
+
+## 7. Non‑Functional Requirements
+
+- Performance: target P95 end‑to‑end send→first‑token latency aligned with Agent Network SLAs; configurable timeouts.
+- Scalability: horizontally scalable stateless workers; memory lives in Agent Network/state store.
+- Reliability: retries/backoff on transient errors; idempotent message creation; persisted runs and final messages.
+- Compatibility: compatible with Agent Networks interface descriptor and versioning model; safe upgrades via pinned versions.
+- Testability: deterministic test mode with mocked Agent Network responses; golden transcripts.
+
+## 8. Implementation Notes
+
+- Use Agent Network `invoke/stream/cancel/resume/status` APIs; pass `thread_id` for memory scoping.
+- Persist full conversation history in database (all user/assistant messages); delegate tool IO and agentic memory to the Agent Network. Propagate citations/knowledge chunks in assistant messages.
+- Reuse platform‑wide schemas from `app/shared/schemas.py` where applicable for message blocks and citation shapes.
+- Ensure strict separation of concerns: Chatbots manage UI‑facing threads/messages; Agent Networks manage reasoning, tools, and memory per thread.
+

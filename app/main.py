@@ -6,6 +6,7 @@ from app.ai_models.controllers import router as ai_models_router
 from app.agent_tools.controllers import router as agent_tools_router
 from app.agent_networks.controllers import router as agent_networks_router
 from app.agents.controllers import router as agents_router
+from app.chatbots.controllers import router as chatbots_router
 
 
 app = FastAPI(
@@ -20,4 +21,5 @@ app.include_router(ai_models_router, prefix="/api/v1")
 app.include_router(agent_tools_router, prefix="/api/v1")
 app.include_router(agents_router, prefix="/api/v1")
 app.include_router(agent_networks_router, prefix="/api/v1")
+app.include_router(chatbots_router, prefix="/api/v1")
 

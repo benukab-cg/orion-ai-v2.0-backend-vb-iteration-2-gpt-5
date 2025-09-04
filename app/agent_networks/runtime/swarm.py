@@ -92,7 +92,39 @@ def invoke_swarm(db: Session, principal: Principal, spec: AgentNetworkSpec, payl
     if not messages and input_text is not None:
         messages = [HumanMessage(content=str(input_text))]
     result = swarm.invoke({"messages": messages or []})
-    return {"output": result}
+
+    # Normalize output to plain text
+    def _coerce_text(obj: Any) -> str:
+        try:
+            if obj is None:
+                return ""
+            if isinstance(obj, str):
+                return obj
+            if isinstance(obj, BaseMessage):
+                return str(getattr(obj, "content", "") or "")
+            if isinstance(obj, list):
+                # Try to find last AI message
+                for msg in reversed(obj):
+                    if isinstance(msg, BaseMessage):
+                        if isinstance(msg, AIMessage):
+                            return str(getattr(msg, "content", "") or "")
+                # Fallback: join stringified items
+                return "\n".join(str(it) for it in obj if it is not None)
+            if isinstance(obj, dict):
+                # Common shape: {"messages": [...]} or nested
+                msgs = obj.get("messages") if hasattr(obj, "get") else None
+                if isinstance(msgs, list):
+                    for msg in reversed(msgs):
+                        if isinstance(msg, BaseMessage) and isinstance(msg, AIMessage):
+                            return str(getattr(msg, "content", "") or "")
+                # Fallback to string
+                return str(obj)
+            return str(obj)
+        except Exception:
+            return str(obj)
+
+    output_text = _coerce_text(result)
+    return {"output": output_text}
 
 
 def _create_context_handoff_tool(*, agent_name: str, description: str | None, source_name: str):
